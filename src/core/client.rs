@@ -1,17 +1,13 @@
-#[cfg(feature = "filter-control")]
 use bitcoin::BlockHash;
-#[cfg(not(feature = "filter-control"))]
-use bitcoin::ScriptBuf;
-use bitcoin::Transaction;
+use bitcoin::{Block, Transaction, Txid};
 use bitcoin::{block::Header, FeeRate};
 use std::{collections::BTreeMap, ops::Range, time::Duration};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Sender;
-
-use crate::{Event, Log, TrustedPeer, TxBroadcast, Warning};
-
-#[cfg(feature = "filter-control")]
-use super::{error::FetchBlockError, messages::BlockRequest, BlockReceiver, IndexedBlock};
+use crate::{BlockchainInfo, Event, IndexedFilter, Log, TrustedPeer, TxBroadcast, Warning};
+use crate::core::messages::{BlockFilterByHeightRequest, BlockchainInfoRequest, HeaderByHashRequest, MempoolEntryRequest, QueueBlocksRequest};
+use crate::rpc::server::MempoolEntryResult;
+use super::{error::DownloadRequestError, messages::BlockRequest};
 use super::{
     error::{ClientError, FetchFeeRateError, FetchHeaderError},
     messages::{BatchHeaderRequest, ClientMessage, HeaderRequest},
@@ -37,8 +33,9 @@ impl Client {
         event_rx: mpsc::UnboundedReceiver<Event>,
         ntx: Sender<ClientMessage>,
     ) -> Self {
+        let requester = Requester::new(ntx);
         Self {
-            requester: Requester::new(ntx),
+            requester: requester.clone(),
             log_rx,
             warn_rx,
             event_rx,
@@ -105,6 +102,32 @@ impl Requester {
             .map_err(|_| ClientError::SendError)
     }
 
+    pub async fn get_mempool_entry(&self, txid: Txid) -> Result<Option<MempoolEntryResult>, ClientError> {
+        let (tx, rx) = tokio::sync::oneshot::channel::<Option<MempoolEntryResult>>();
+        let message = MempoolEntryRequest {oneshot: tx, txid};
+
+        self.ntx
+            .send(ClientMessage::GetMempoolEntry(message))
+            .await
+            .map_err(|_| ClientError::SendError)?;
+        Ok(rx.await.map_err(|_| ClientError::SendError)?)
+    }
+
+    pub async fn queue_blocks(&self, heights: Vec<u32>) -> Result<(), ClientError> {
+        let (tx, rx) =
+            tokio::sync::oneshot::channel::<anyhow::Result<()>>();
+        self.ntx
+            .send(ClientMessage::QueueBlocks(QueueBlocksRequest {
+                oneshot: tx,
+                blocks: heights,
+            }))
+            .await
+            .map_err(|_| ClientError::SendError).map_err(|_| ClientError::SendError)?;
+
+        Ok(rx.await.map_err(|e| ClientError::Custom(e.to_string()))?
+            .map_err(|e| ClientError::Custom(e.to_string()))?)
+    }
+
     /// Broadcast a new transaction to the network to a random peer.
     ///
     /// # Errors
@@ -117,6 +140,8 @@ impl Requester {
             .await
             .map_err(|_| ClientError::SendError)
     }
+
+
 
     /// Broadcast a new transaction to the network from a synchronus context.
     ///
@@ -151,37 +176,6 @@ impl Requester {
         rx.await.map_err(|_| FetchFeeRateError::RecvError)
     }
 
-    /// Add more Bitcoin [`ScriptBuf`] to watch for. Does not rescan the filters.
-    /// If the script was already present in the node's collection, no change will occur.
-    ///
-    /// # Errors
-    ///
-    /// If the node has stopped running.
-    #[cfg(not(feature = "filter-control"))]
-    pub async fn add_script(&self, script: impl Into<ScriptBuf>) -> Result<(), ClientError> {
-        self.ntx
-            .send(ClientMessage::AddScript(script.into()))
-            .await
-            .map_err(|_| ClientError::SendError)
-    }
-
-    /// Add more Bitcoin [`ScriptBuf`] to watch for from a synchronus context. Does not rescan the filters.
-    /// If the script was already present in the node's collection, no change will occur.
-    ///
-    /// # Errors
-    ///
-    /// If the node has stopped running.
-    ///
-    /// # Panics
-    ///
-    /// When called within an asynchronus context (e.g `tokio::main`).
-    #[cfg(not(feature = "filter-control"))]
-    pub fn add_script_blocking(&self, script: impl Into<ScriptBuf>) -> Result<(), ClientError> {
-        self.ntx
-            .blocking_send(ClientMessage::AddScript(script.into()))
-            .map_err(|_| ClientError::SendError)
-    }
-
     /// Get a header at the specified height, if it exists.
     ///
     /// # Note
@@ -197,6 +191,37 @@ impl Requester {
         let message = HeaderRequest::new(tx, height);
         self.ntx
             .send(ClientMessage::GetHeader(message))
+            .await
+            .map_err(|_| FetchHeaderError::SendError)?;
+        rx.await.map_err(|_| FetchHeaderError::RecvError)?
+    }
+
+    pub async fn get_header_by_hash(&self, hash: BlockHash) -> Result<Header, FetchHeaderError> {
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<Header, FetchHeaderError>>();
+        let message = HeaderByHashRequest::new(tx, hash);
+        self.ntx
+            .send(ClientMessage::GetHeaderByHash(message))
+            .await
+            .map_err(|_| FetchHeaderError::SendError)?;
+        rx.await.map_err(|_| FetchHeaderError::RecvError)?
+    }
+
+    pub async fn get_blockchain_info(&self) -> Result<BlockchainInfo, FetchHeaderError> {
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<BlockchainInfo, FetchHeaderError>>();
+        let message = BlockchainInfoRequest {oneshot: tx};
+        self.ntx
+            .send(ClientMessage::GetBlockchainInfo(message))
+            .await
+            .map_err(|_| FetchHeaderError::SendError)?;
+        rx.await.map_err(|_| FetchHeaderError::RecvError)?
+    }
+
+    pub async fn get_block_filter(&self, height: u32) -> Result<Option<IndexedFilter>, FetchHeaderError> {
+        let (tx, rx) =
+            tokio::sync::oneshot::channel::<Result<Option<IndexedFilter>, FetchHeaderError>>();
+        let message = BlockFilterByHeightRequest {oneshot: tx, height};
+        self.ntx
+            .send(ClientMessage::GetBlockFilterByHeight(message))
             .await
             .map_err(|_| FetchHeaderError::SendError)?;
         rx.await.map_err(|_| FetchHeaderError::RecvError)?
@@ -245,42 +270,16 @@ impl Requester {
         rx.await.map_err(|_| FetchHeaderError::RecvError)?
     }
 
-    /// Request a block be fetched. Note that this method will request a block
-    /// from a connected peer's inventory, and may take an indefinite amount of
-    /// time, until a peer responds.
-    ///
-    /// # Errors
-    ///
-    /// If the node has stopped running.
-    #[cfg(feature = "filter-control")]
-    pub async fn get_block(&self, block_hash: BlockHash) -> Result<IndexedBlock, FetchBlockError> {
-        let (tx, rx) = tokio::sync::oneshot::channel::<Result<IndexedBlock, FetchBlockError>>();
-        let message = BlockRequest::new(tx, block_hash);
-        self.ntx
-            .send(ClientMessage::GetBlock(message))
-            .await
-            .map_err(|_| FetchBlockError::SendError)?;
-        rx.await.map_err(|_| FetchBlockError::RecvError)?
-    }
+    pub async fn get_block(&self, hash: BlockHash) -> Result<Block, DownloadRequestError> {
+        let (tx, rx) = tokio::sync::oneshot::channel::<Result<Block, DownloadRequestError>>();
 
-    /// Request a block be fetched and receive a [`tokio::sync::oneshot::Receiver`]
-    /// to await the resulting block.
-    ///
-    /// # Errors
-    ///
-    /// If the node has stopped running.
-    #[cfg(feature = "filter-control")]
-    pub async fn request_block(
-        &self,
-        block_hash: BlockHash,
-    ) -> Result<BlockReceiver, FetchBlockError> {
-        let (tx, rx) = tokio::sync::oneshot::channel::<Result<IndexedBlock, FetchBlockError>>();
-        let message = BlockRequest::new(tx, block_hash);
+        let request = BlockRequest::new(tx, hash);
+
         self.ntx
-            .send(ClientMessage::GetBlock(message))
+            .send(ClientMessage::GetBlock(vec![request]))
             .await
-            .map_err(|_| FetchBlockError::SendError)?;
-        Ok(rx)
+            .map_err(|_| DownloadRequestError::SendError)?;
+        rx.await.map_err(|_| DownloadRequestError::RecvError)?
     }
 
     /// Starting at the configured anchor checkpoint, look for block inclusions with newly added scripts.
@@ -338,6 +337,8 @@ impl Requester {
     }
 }
 
+
+
 impl<T> From<tokio::sync::mpsc::error::SendError<T>> for ClientError {
     fn from(_: tokio::sync::mpsc::error::SendError<T>) -> Self {
         ClientError::SendError
@@ -357,7 +358,7 @@ mod tests {
         let (log_tx, log_rx) = tokio::sync::mpsc::channel::<Log>(1);
         let (_, warn_rx) = tokio::sync::mpsc::unbounded_channel::<Warning>();
         let (_, event_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
-        let (ctx, crx) = mpsc::channel::<ClientMessage>(5);
+        let (ctx, crx) = mpsc::channel::<ClientMessage>(10_000_000);
         let Client {
             requester,
             mut log_rx,

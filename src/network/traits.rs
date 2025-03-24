@@ -1,21 +1,18 @@
 use core::fmt::Debug;
 use std::{net::IpAddr, time::Duration};
 
-use bitcoin::{
-    p2p::{
-        address::AddrV2,
-        message::NetworkMessage,
-        message_filter::{GetCFHeaders, GetCFilters},
-    },
-    BlockHash, Transaction, Wtxid,
-};
+use bitcoin::{p2p::{
+    address::AddrV2,
+    message::NetworkMessage,
+    message_filter::{GetCFHeaders, GetCFilters},
+}, BlockHash, Transaction, Txid, Wtxid};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpStream,
     sync::Mutex,
 };
 
-use crate::{core::channel_messages::GetBlockConfig, prelude::FutureResult};
+use crate::{prelude::FutureResult};
 
 use super::error::{PeerError, PeerReadError};
 
@@ -46,7 +43,9 @@ pub(crate) trait MessageGenerator: Send + Sync {
 
     fn filters(&mut self, message: GetCFilters) -> Result<Vec<u8>, PeerError>;
 
-    fn block(&mut self, config: GetBlockConfig) -> Result<Vec<u8>, PeerError>;
+    fn block(&mut self, config: Vec<BlockHash>) -> Result<Vec<u8>, PeerError>;
+
+    fn tx(&mut self, config: Vec<Txid>) -> Result<Vec<u8>, PeerError>;
 
     fn pong(&mut self, nonce: u64) -> Result<Vec<u8>, PeerError>;
 

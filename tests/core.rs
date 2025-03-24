@@ -597,7 +597,7 @@ async fn halting_download_works() {
         .add_peers(vec![host.into()])
         .add_scripts(scripts)
         .data_dir(tempdir)
-        .halt_filter_download()
+        // .halt_filter_download()
         .build()
         .unwrap();
 

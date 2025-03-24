@@ -34,21 +34,19 @@ impl Dialog {
         &self,
         num_headers: u32,
         num_cf_headers: u32,
-        num_filters: u32,
         best_height: u32,
     ) {
         let _ = self
             .log_tx
             .send(Log::Progress(Progress::new(
                 num_cf_headers,
-                num_filters,
                 best_height,
             )))
             .await;
         if matches!(self.log_level, LogLevel::Debug) {
             let message = format!(
-                "Headers ({}/{}) Compact Filter Headers ({}/{}) Filters ({}/{})",
-                num_headers, best_height, num_cf_headers, best_height, num_filters, best_height
+                "Headers ({}/{}) Compact Filter Headers ({}/{})",
+                num_headers, best_height, num_cf_headers, best_height,
             );
             let _ = self.log_tx.send(Log::Debug(message)).await;
         }

@@ -72,6 +72,6 @@ impl Distribution<PeerStatus> for Standard {
 impl PeerStatus {
     pub(crate) fn random() -> PeerStatus {
         let mut rng = thread_rng();
-        rng.gen()
+        rng.r#gen()
     }
 }

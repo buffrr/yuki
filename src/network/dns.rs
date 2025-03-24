@@ -8,6 +8,7 @@ use std::{
     io::Read,
     net::{IpAddr, Ipv4Addr, SocketAddr},
 };
+use bitcoin::p2p::ServiceFlags;
 use tokio::net::UdpSocket;
 
 use super::error::DNSQueryError;
@@ -23,12 +24,9 @@ const TESTNET_SEEDS: &[&str; 4] = &[
     "testnet-seed.bluematt.me",
 ];
 
-const MAINNET_SEEDS: &[&str; 9] = &[
-    "seed.bitcoin.sipa.be",
+const MAINNET_SEEDS: &[&str; 6] = &[
     "dnsseed.bluematt.me",
-    "dnsseed.bitcoin.dashjr.org",
     "seed.bitcoinstats.com",
-    "seed.bitcoin.jonasschnelli.ch",
     "seed.btc.petertodd.org",
     "seed.bitcoin.sprovoost.nl",
     "dnsseed.emzy.de",
@@ -98,11 +96,20 @@ impl Dns<'_> {
         }
     }
 
-    pub async fn bootstrap(&self) -> Result<Vec<IpAddr>, DnsBootstrapError> {
+    pub async fn bootstrap(&self, flags: ServiceFlags) -> Result<Vec<IpAddr>, DnsBootstrapError> {
         let mut ip_addrs: Vec<IpAddr> = vec![];
 
         for host in &self.seeds {
-            match DNSQuery::new(host).lookup(self.dns_resolver.into()).await {
+            let mut host = host.to_string();
+            // https://bitcoin.stackexchange.com/questions/109966/bitcoin-dns-seed-flags
+            if flags.has(ServiceFlags::COMPACT_FILTERS) {
+                host = format!("x49.{}", host);
+            } else if flags.has(ServiceFlags::NETWORK) {
+                // NODE_NETWORK | NODE_WITNESS
+                host = format!("x9.{}", host)
+            }
+
+            match DNSQuery::new(&host).lookup(self.dns_resolver.into()).await {
                 Ok(addrs) => ip_addrs.extend(addrs),
                 Err(e) => eprintln!("{e}"),
             }
@@ -263,7 +270,7 @@ mod test {
             bitcoin::network::Network::Signet,
             DnsResolver { socket_addr },
         )
-        .bootstrap()
+        .bootstrap(ServiceFlags::NONE)
         .await
         .unwrap();
         assert!(addrs.len() > 1);

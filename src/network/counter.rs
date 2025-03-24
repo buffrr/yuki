@@ -101,6 +101,7 @@ impl MessageCounter {
         self.tx += 1;
     }
 
+    #[allow(dead_code)]
     pub(crate) fn unsolicited(&self) -> bool {
         self.version < 0
             || self.header < 0

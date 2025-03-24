@@ -105,13 +105,17 @@ impl<H: Debug + Display> std::error::Error for HeaderPersistenceError<H> {
 pub enum ClientError {
     /// The channel to the node was likely closed and dropped from memory.
     SendError,
+    Custom(String)
 }
 
-impl core::fmt::Display for ClientError {
+impl Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ClientError::SendError => {
                 write!(f, "the receiver of this message was dropped from memory.")
+            }
+            ClientError::Custom(e) => {
+                write!(f, "{}", e)
             }
         }
     }
@@ -133,7 +137,7 @@ pub enum FetchHeaderError {
     /// The channel to the client was likely closed by the node and dropped from memory.
     RecvError,
     /// The header at the requested height does not yet exist.
-    UnknownHeight,
+    UnknownHeight(u32),
 }
 
 impl core::fmt::Display for FetchHeaderError {
@@ -152,8 +156,8 @@ impl core::fmt::Display for FetchHeaderError {
                 f,
                 "the channel to the client was likely closed by the node and dropped from memory."
             ),
-            FetchHeaderError::UnknownHeight => {
-                write!(f, "the header at the requested height does not yet exist.")
+            FetchHeaderError::UnknownHeight(height) => {
+                write!(f, "the header at the requested height {} does not exist.", height)
             }
         }
     }
@@ -162,8 +166,8 @@ impl core::fmt::Display for FetchHeaderError {
 impl_sourceless_error!(FetchHeaderError);
 
 /// Errors occuring when the client is fetching blocks from the node.
-#[derive(Debug)]
-pub enum FetchBlockError {
+#[derive(Debug, Clone)]
+pub enum DownloadRequestError {
     /// The channel to the node was likely closed and dropped from memory.
     /// This implies the node is not running.
     SendError,
@@ -174,34 +178,39 @@ pub enum FetchBlockError {
     },
     /// The channel to the client was likely closed by the node and dropped from memory.
     RecvError,
+    Timeout,
     /// The hash is not a member of the chain of most work.
     UnknownHash,
 }
 
-impl core::fmt::Display for FetchBlockError {
+impl core::fmt::Display for DownloadRequestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FetchBlockError::SendError => {
+            DownloadRequestError::SendError => {
                 write!(f, "the receiver of this message was dropped from memory.")
             }
-            FetchBlockError::DatabaseOptFailed { error } => {
+            DownloadRequestError::DatabaseOptFailed { error } => {
                 write!(
                     f,
                     "the database operation failed while attempting to find the header: {error}"
                 )
             }
-            FetchBlockError::RecvError => write!(
+            DownloadRequestError::RecvError => write!(
                 f,
                 "the channel to the client was likely closed by the node and dropped from memory."
             ),
-            FetchBlockError::UnknownHash => {
+            DownloadRequestError::Timeout => write!(
+                f,
+                "timeout."
+            ),
+            DownloadRequestError::UnknownHash => {
                 write!(f, "the hash is not a member of the chain of most work.")
             }
         }
     }
 }
 
-impl_sourceless_error!(FetchBlockError);
+impl_sourceless_error!(DownloadRequestError);
 
 /// Errors that occur when fetching the minimum fee rate to broadcast a transaction.
 #[derive(Debug)]

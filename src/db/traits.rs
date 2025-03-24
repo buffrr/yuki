@@ -50,6 +50,7 @@ pub trait PeerStore: Debug + Send + Sync {
     type Error: Debug + Display;
     /// Add a peer to the database, defining if it should be replaced or not.
     fn update(&mut self, peer: PersistedPeer) -> FutureResult<(), Self::Error>;
+    fn delete_all(&mut self) -> FutureResult<(), Self::Error>;
 
     /// Get any peer from the database, selected at random. If no peers exist, an error is thrown.
     fn random(&mut self) -> FutureResult<PersistedPeer, Self::Error>;

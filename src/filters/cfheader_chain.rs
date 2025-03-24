@@ -1,7 +1,9 @@
 use std::collections::HashMap;
-
+use std::io::{BufReader};
+use std::path::PathBuf;
 use bitcoin::{BlockHash, FilterHash, FilterHeader};
-
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncWriteExt};
 use crate::chain::checkpoints::HeaderCheckpoint;
 
 use super::cfheader_batch::CFHeaderBatch;
@@ -18,7 +20,7 @@ pub(crate) enum AppendAttempt {
     Conflict(BlockHash),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct QueuedCFHeader {
     pub block_hash: BlockHash,
     pub filter_header: FilterHeader,
@@ -54,7 +56,7 @@ impl QueuedCFHeader {
 
 type Queue = Vec<QueuedCFHeader>;
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct CFHeaderChain {
     pub(crate) merged_queue: Option<Queue>,
     anchor_checkpoint: HeaderCheckpoint,
@@ -78,6 +80,27 @@ impl CFHeaderChain {
             quorum_required,
             current_quorum: 0,
         }
+    }
+
+    pub fn checkpoint(&self) -> &HeaderCheckpoint {
+        &self.anchor_checkpoint
+    }
+
+    pub async fn save(&self, path: PathBuf) -> anyhow::Result<()> {
+        let mut file = tokio::fs::File::create(path).await?;
+        let config = bincode::config::standard();
+        let bytes = bincode::serde::encode_to_vec(self, config)?;
+        file.write_all(&bytes).await?;
+        file.flush().await?;
+        Ok(())
+    }
+
+    pub fn load(path: PathBuf) -> anyhow::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        let mut reader = BufReader::new(file);
+        let config = bincode::config::standard();
+        let value = bincode::serde::decode_from_std_read(&mut reader, config)?;
+        Ok(value)
     }
 
     // Set a reference point for the block hashes and associated filter hash.

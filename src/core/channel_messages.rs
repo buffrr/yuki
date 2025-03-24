@@ -1,15 +1,11 @@
-use bitcoin::{
-    block::Header,
-    p2p::{
-        address::AddrV2,
-        message_filter::{CFHeaders, CFilter, GetCFHeaders, GetCFilters},
-        message_network::VersionMessage,
-        ServiceFlags,
-    },
-    Block, BlockHash, FeeRate, Transaction, Wtxid,
-};
-
-use crate::core::messages::RejectPayload;
+use bitcoin::{block::Header, p2p::{
+    address::AddrV2,
+    message_filter::{CFHeaders, CFilter, GetCFHeaders, GetCFilters},
+    message_network::VersionMessage,
+    ServiceFlags,
+}, Block, BlockHash, FeeRate, Transaction, Txid, Wtxid};
+use bitcoin::p2p::message_blockdata::Inventory;
+use crate::core::messages::{RejectPayload};
 
 use super::PeerId;
 
@@ -21,7 +17,8 @@ pub(crate) enum MainThreadMessage {
     GetHeaders(GetHeaderConfig),
     GetFilterHeaders(GetCFHeaders),
     GetFilters(GetCFilters),
-    GetBlock(GetBlockConfig),
+    GetTx(Vec<Txid>),
+    GetBlock(Vec<BlockHash>),
     Disconnect,
     BroadcastTx(Transaction),
     Verack,
@@ -31,11 +28,6 @@ pub(crate) enum MainThreadMessage {
 pub struct GetHeaderConfig {
     pub locators: Vec<BlockHash>,
     pub stop_hash: Option<BlockHash>,
-}
-
-#[derive(Debug, Clone)]
-pub struct GetBlockConfig {
-    pub locator: BlockHash,
 }
 
 pub(crate) struct PeerThreadMessage {
@@ -50,9 +42,11 @@ pub(crate) enum PeerMessage {
     Headers(Vec<Header>),
     FilterHeaders(CFHeaders),
     Filter(CFilter),
+    Tx(Transaction),
     Block(Block),
     NewBlocks(Vec<BlockHash>),
     Reject(RejectPayload),
+    NotFound(Vec<Inventory>),
     Disconnect,
     Verack,
     Ping(u64),

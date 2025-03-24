@@ -1,11 +1,9 @@
 pub(crate) const CF_HEADER_BATCH_SIZE: u32 = 1_999;
-pub(crate) const FILTER_BATCH_SIZE: u32 = 99;
 
 pub(crate) mod cfheader_batch;
 pub(crate) mod cfheader_chain;
 #[allow(dead_code)]
 pub(crate) mod error;
-pub(crate) mod filter_chain;
 
 use bitcoin::hashes::{sha256d, Hash};
 use bitcoin::{bip158::BlockFilter, BlockHash, FilterHash, ScriptBuf};
@@ -13,7 +11,7 @@ use bitcoin::{bip158::BlockFilter, BlockHash, FilterHash, ScriptBuf};
 use error::FilterError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Filter {
+pub struct Filter {
     filter_hash: FilterHash,
     block_hash: BlockHash,
     block_filter: BlockFilter,
@@ -30,6 +28,10 @@ impl Filter {
             block_hash,
             block_filter,
         }
+    }
+
+    pub fn to_bytes(self) -> Vec<u8> {
+        self.block_filter.content
     }
 
     pub fn filter_hash(&self) -> &FilterHash {

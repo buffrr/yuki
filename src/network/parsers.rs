@@ -4,12 +4,26 @@ use bitcoin::consensus::{deserialize, deserialize_partial};
 use bitcoin::p2p::message::RawNetworkMessage;
 use bitcoin::Network;
 use tokio::io::AsyncReadExt;
-
 use crate::prelude::FutureResult;
 
 use super::error::PeerReadError;
 use super::traits::{MessageParser, StreamReader};
 use super::V1Header;
+
+fn verify_network_message(msg: &NetworkMessage) -> bool {
+    match msg {
+        NetworkMessage::Block(block) => {
+            if !block.check_merkle_root() {
+                return false
+            }
+            if !block.check_witness_commitment() {
+                return false
+            }
+        }
+        _ => {}
+    }
+    true
+}
 
 const MAX_MESSAGE_BYTES: u32 = 1024 * 1024 * 32;
 
@@ -47,9 +61,20 @@ impl V1MessageParser {
             .await
             .map_err(|_| PeerReadError::ReadBuffer)?;
         message_buf.extend_from_slice(&contents_buf);
-        let message: RawNetworkMessage =
-            deserialize(&message_buf).map_err(|_| PeerReadError::Deserialization)?;
-        Ok(Some(message.into_payload()))
+
+        let message: NetworkMessage = tokio::task::spawn_blocking(move || {
+            let result: Result<NetworkMessage, _> = deserialize
+                ::<RawNetworkMessage>(&message_buf)
+                .map(|r| r.into_payload())
+                .map_err(|_| PeerReadError::Deserialization);
+
+            if !result.as_ref().is_ok_and(|m| verify_network_message(m)) {
+                return Err(PeerReadError::Deserialization)
+            }
+            result
+        }).await.map_err(|_| PeerReadError::MpscChannel)??;
+
+        Ok(Some(message))
     }
 }
 
@@ -91,8 +116,14 @@ impl V2MessageParser {
             .map_err(|_| PeerReadError::DecryptionFailed)?;
         match msg.packet_type() {
             PacketType::Genuine => {
-                let parsed = bip324::serde::deserialize(msg.contents())
-                    .map_err(|_| PeerReadError::Deserialization)?;
+                let parsed = tokio::task::spawn_blocking(move || {
+                    let result = bip324::serde::deserialize(msg.contents())
+                        .map_err(|_| PeerReadError::Deserialization);
+                    if !result.as_ref().is_ok_and(|m| verify_network_message(m)) {
+                        return Err(PeerReadError::Deserialization)
+                    }
+                    result
+                }).await.map_err(|_| PeerReadError::MpscChannel)??;
                 Ok(Some(parsed))
             }
             PacketType::Decoy => Ok(None),

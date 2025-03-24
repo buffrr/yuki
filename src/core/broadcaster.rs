@@ -14,6 +14,7 @@ impl Broadcaster {
         self.queue.push(tx)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }

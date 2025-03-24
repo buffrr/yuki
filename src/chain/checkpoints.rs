@@ -1,6 +1,7 @@
 use std::{collections::VecDeque, str::FromStr};
 
 use bitcoin::{BlockHash, Network};
+use serde::{Deserialize, Serialize};
 
 type Height = u32;
 /// Known block hashes for Regtest. Only the genesis hash.
@@ -490,7 +491,7 @@ pub const MAINNET_HEADER_CP: &[(Height, &str)] = &[
 ];
 
 /// A known block hash in the chain of most work.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct HeaderCheckpoint {
     /// The index of the block hash.
     pub height: Height,

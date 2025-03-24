@@ -83,7 +83,6 @@
 //!
 //! `tor` *No MSRV guarantees*: connect to nodes over the Tor network.
 
-#![warn(missing_docs)]
 pub mod chain;
 pub mod core;
 pub mod db;
@@ -91,10 +90,10 @@ pub mod db;
 mod filters;
 mod network;
 mod prelude;
-#[cfg(feature = "filter-control")]
+pub mod rpc;
+pub mod app;
+
 use filters::Filter;
-#[cfg(feature = "filter-control")]
-use std::collections::HashSet;
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -135,6 +134,7 @@ pub use bitcoin::{
     block::Header, p2p::address::AddrV2, p2p::message_network::RejectReason, p2p::ServiceFlags,
     Address, Block, BlockHash, FeeRate, Network, ScriptBuf, Transaction, Txid,
 };
+use bitcoin::Work;
 
 pub extern crate tokio;
 
@@ -185,12 +185,6 @@ pub struct IndexedBlock {
     pub block: Block,
 }
 
-impl IndexedBlock {
-    pub(crate) fn new(height: u32, block: Block) -> Self {
-        Self { height, block }
-    }
-}
-
 #[cfg(feature = "filter-control")]
 /// A compact block filter with associated height.
 #[derive(Debug, Clone)]
@@ -230,6 +224,28 @@ pub struct TxBroadcast {
     pub tx: Transaction,
     /// The strategy for how this transaction should be shared with the network.
     pub broadcast_policy: TxBroadcastPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockchainInfo {
+    pub chain: String,
+    pub blocks: u32,
+    pub headers: u32,
+    #[serde(rename = "bestblockhash")]
+    pub best_blockhash: Option<BlockHash>,
+    #[serde(rename = "mediantime")]
+    pub median_time: i64,
+    #[serde(rename = "chainwork")]
+    pub chain_work: Work,
+    #[serde(rename = "pruneheight")]
+    pub prune_height: Option<u32>,
+    pub pruned: bool,
+    pub filters: u32,
+    #[serde(rename = "filterheaders")]
+    pub filter_headers: u32,
+    #[serde(rename = "blockqueue")]
+    pub block_queue: QueueBlocksStatus,
+    pub checkpoint: HeaderCheckpoint,
 }
 
 impl TxBroadcast {
@@ -449,3 +465,5 @@ macro_rules! log {
 }
 
 pub(crate) use log;
+use serde::{Deserialize, Serialize};
+use crate::core::node::QueueBlocksStatus;

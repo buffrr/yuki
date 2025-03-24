@@ -60,7 +60,7 @@ impl Reader {
                 let addresses: Vec<CombinedAddr> = addresses
                     .iter()
                     .map(|(_, addr)| addr)
-                    .filter(|addr| addr.services.has(ServiceFlags::COMPACT_FILTERS))
+                    .filter(|addr| addr.services.has(ServiceFlags::NETWORK))
                     .filter_map(|addr| addr.socket_addr().ok().map(|sock| (addr.port, sock)))
                     .map(|(port, addr)| {
                         let ip = match addr.ip() {
@@ -106,11 +106,11 @@ impl Reader {
                 }
                 Some(PeerMessage::TxRequests(requests))
             }
-            NetworkMessage::NotFound(_) => None,
+            NetworkMessage::NotFound(inv) => Some(PeerMessage::NotFound(inv)),
             NetworkMessage::GetBlocks(_) => None,
             NetworkMessage::GetHeaders(_) => None,
             NetworkMessage::MemPool => None,
-            NetworkMessage::Tx(_) => None,
+            NetworkMessage::Tx(tx) => Some(PeerMessage::Tx(tx)),
             NetworkMessage::Block(block) => Some(PeerMessage::Block(block)),
             NetworkMessage::Headers(headers) => {
                 if headers.len() > MAX_HEADERS {
@@ -165,7 +165,7 @@ impl Reader {
                 }
                 let addresses: Vec<CombinedAddr> = addresses
                     .into_iter()
-                    .filter(|f| f.services.has(ServiceFlags::COMPACT_FILTERS))
+                    .filter(|f| f.services.has(ServiceFlags::NETWORK))
                     .map(|addr| {
                         let port = addr.port;
                         let mut ip = CombinedAddr::new(addr.addr, port);

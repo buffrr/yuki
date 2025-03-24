@@ -97,6 +97,12 @@ impl SqlitePeerDb {
         Ok(())
     }
 
+    async fn delete_all(&mut self) -> Result<(), SqlPeerStoreError> {
+        let lock = self.conn.lock().await;
+        lock.execute("DELETE FROM peers", [])?;
+        Ok(())
+    }
+
     async fn random(&mut self) -> Result<PersistedPeer, SqlPeerStoreError> {
         let lock = self.conn.lock().await;
         let mut stmt =
@@ -133,6 +139,10 @@ impl PeerStore for SqlitePeerDb {
     type Error = SqlPeerStoreError;
     fn update(&mut self, peer: PersistedPeer) -> FutureResult<(), Self::Error> {
         Box::pin(self.update(peer))
+    }
+
+    fn delete_all(&mut self) -> FutureResult<(), Self::Error> {
+        Box::pin(self.delete_all())
     }
 
     fn random(&mut self) -> FutureResult<PersistedPeer, Self::Error> {

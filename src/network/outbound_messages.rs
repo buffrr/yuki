@@ -4,20 +4,14 @@ use std::{
 };
 
 use bip324::{PacketType, PacketWriter};
-use bitcoin::{
-    consensus::serialize,
-    hashes::Hash,
-    p2p::{
-        message::{NetworkMessage, RawNetworkMessage},
-        message_blockdata::{GetHeadersMessage, Inventory},
-        message_filter::{GetCFHeaders, GetCFilters},
-        message_network::VersionMessage,
-        Address, ServiceFlags,
-    },
-    BlockHash, Network, Transaction, Wtxid,
-};
-
-use crate::{core::channel_messages::GetBlockConfig, prelude::default_port_from_network};
+use bitcoin::{consensus::serialize, hashes::Hash, p2p::{
+    message::{NetworkMessage, RawNetworkMessage},
+    message_blockdata::{GetHeadersMessage, Inventory},
+    message_filter::{GetCFHeaders, GetCFilters},
+    message_network::VersionMessage,
+    Address, ServiceFlags,
+}, BlockHash, Network, Transaction, Txid, Wtxid};
+use crate::{prelude::default_port_from_network};
 
 use super::{
     error::PeerError, traits::MessageGenerator, KYOTO_VERSION, PROTOCOL_VERSION,
@@ -60,13 +54,11 @@ fn make_version(port: Option<u16>, network: &Network) -> VersionMessage {
     }
 }
 
-fn get_block_from_cfg(config: GetBlockConfig) -> Inventory {
-    if cfg!(feature = "filter-control") {
-        Inventory::WitnessBlock(config.locator)
-    } else {
-        Inventory::Block(config.locator)
-    }
+fn get_block_from_cfg(config: Vec<BlockHash>) -> Vec<Inventory> {
+    config.into_iter().map(|block| Inventory::WitnessBlock(block)).collect()
 }
+
+
 
 impl MessageGenerator for V1OutboundMessage {
     fn version_message(&mut self, port: Option<u16>) -> Result<Vec<u8>, PeerError> {
@@ -118,9 +110,15 @@ impl MessageGenerator for V1OutboundMessage {
         Ok(serialize(&data))
     }
 
-    fn block(&mut self, config: GetBlockConfig) -> Result<Vec<u8>, PeerError> {
+    fn block(&mut self, config: Vec<BlockHash>) -> Result<Vec<u8>, PeerError> {
         let inv = get_block_from_cfg(config);
-        let data = RawNetworkMessage::new(self.network.magic(), NetworkMessage::GetData(vec![inv]));
+        let data = RawNetworkMessage::new(self.network.magic(), NetworkMessage::GetData(inv));
+        Ok(serialize(&data))
+    }
+
+    fn tx(&mut self, txids: Vec<Txid>) -> Result<Vec<u8>, PeerError> {
+        let inv : Vec<_> = txids.into_iter().map(|txid| Inventory::WitnessTransaction(txid)).collect();
+        let data = RawNetworkMessage::new(self.network.magic(), NetworkMessage::GetData(inv));
         Ok(serialize(&data))
     }
 
@@ -212,9 +210,15 @@ impl MessageGenerator for V2OutboundMessage {
         self.encrypt_plaintext(plaintext)
     }
 
-    fn block(&mut self, config: GetBlockConfig) -> Result<Vec<u8>, PeerError> {
+    fn block(&mut self, config: Vec<BlockHash>) -> Result<Vec<u8>, PeerError> {
         let inv = get_block_from_cfg(config);
-        let plaintext = self.serialize_network_message(NetworkMessage::GetData(vec![inv]))?;
+        let plaintext = self.serialize_network_message(NetworkMessage::GetData(inv))?;
+        self.encrypt_plaintext(plaintext)
+    }
+
+    fn tx(&mut self, txids: Vec<Txid>) -> Result<Vec<u8>, PeerError> {
+        let inv: Vec<_> = txids.into_iter().map(|txid| Inventory::WitnessTransaction(txid)).collect();
+        let plaintext = self.serialize_network_message(NetworkMessage::GetData(inv))?;
         self.encrypt_plaintext(plaintext)
     }
 

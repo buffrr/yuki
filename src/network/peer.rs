@@ -36,13 +36,14 @@ use super::outbound_messages::V2OutboundMessage;
 #[cfg(not(feature = "tor"))]
 use super::parsers::V2MessageParser;
 
-const MESSAGE_TIMEOUT: u64 = 2;
+const MESSAGE_TIMEOUT: u64 = 6;
 const HANDSHAKE_TIMEOUT: u64 = 4;
 
 type MutexMessageGenerator = Mutex<Box<dyn MessageGenerator>>;
 
 pub(crate) struct Peer {
     nonce: PeerId,
+    start_time: Instant,
     main_thread_sender: Sender<PeerThreadMessage>,
     main_thread_recv: Receiver<MainThreadMessage>,
     network: Network,
@@ -74,6 +75,7 @@ impl Peer {
             dialog,
             timeout_config,
             tx_queue: HashMap::new(),
+            start_time: Instant::now(),
         }
     }
 
@@ -83,6 +85,7 @@ impl Peer {
         writer: StreamWriter,
     ) -> Result<(), PeerError> {
         let start_time = Instant::now();
+        self.start_time = start_time;
         let (tx, mut rx) = mpsc::channel(32);
         let mut lock = writer.lock().await;
         let writer = lock.deref_mut();
@@ -142,10 +145,10 @@ impl Peer {
             if read_handle.is_finished() {
                 return Ok(());
             }
-            if self.message_counter.unsolicited() {
-                self.dialog.send_warning(Warning::UnsolicitedMessage);
-                return Ok(());
-            }
+            // if self.message_counter.unsolicited() {
+            //     self.dialog.send_warning(Warning::UnsolicitedMessage);
+            //     return Ok(());
+            // }
             if self.message_counter.unresponsive() {
                 self.dialog.send_warning(Warning::PeerTimedOut);
                 return Ok(());
@@ -265,6 +268,16 @@ impl Peer {
                     .map_err(|_| PeerError::ThreadChannel)?;
                 Ok(())
             }
+            PeerMessage::Tx(tx) => {
+                self.main_thread_sender
+                    .send(PeerThreadMessage {
+                        nonce: self.nonce,
+                        message: PeerMessage::Tx(tx),
+                    })
+                    .await
+                    .map_err(|_| PeerError::ThreadChannel)?;
+                Ok(())
+            }
             PeerMessage::Block(block) => {
                 self.message_counter.got_block();
                 self.main_thread_sender
@@ -336,6 +349,16 @@ impl Peer {
                     .map_err(|_| PeerError::ThreadChannel)?;
                 Err(PeerError::DisconnectCommand)
             }
+            PeerMessage::NotFound(payload) => {
+                self.main_thread_sender
+                    .send(PeerThreadMessage {
+                        nonce: self.nonce,
+                        message: PeerMessage::NotFound(payload),
+                    })
+                    .await
+                    .map_err(|_| PeerError::ThreadChannel)?;
+                Ok(())
+            }
         }
     }
 
@@ -377,8 +400,15 @@ impl Peer {
                 let message = message_generator.filters(config)?;
                 self.write_bytes(writer, message).await?;
             }
+            MainThreadMessage::GetTx(txids) => {
+                let message = message_generator.tx(txids)?;
+                self.write_bytes(writer, message).await?;
+            }
             MainThreadMessage::GetBlock(message) => {
-                self.message_counter.sent_block();
+                for _ in 0..message.len() {
+                    self.message_counter.sent_block();
+                }
+
                 let message = message_generator.block(message)?;
                 self.write_bytes(writer, message).await?;
             }
@@ -389,11 +419,13 @@ impl Peer {
                 self.tx_queue.insert(wtxid, transaction);
                 self.write_bytes(writer, message).await?;
             }
+
             MainThreadMessage::Verack => {
                 let message = message_generator.verack()?;
                 self.write_bytes(writer, message).await?;
             }
             MainThreadMessage::Disconnect => return Err(PeerError::DisconnectCommand),
+
         }
         Ok(())
     }

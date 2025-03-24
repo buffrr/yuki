@@ -1,37 +1,34 @@
 use std::{ops::DerefMut, sync::Arc, time::Duration};
-
-use bitcoin::{
-    block::Header,
-    p2p::{
-        message_filter::{CFHeaders, CFilter},
-        message_network::VersionMessage,
-        ServiceFlags,
-    },
-    Block, BlockHash, Network, ScriptBuf,
-};
+use std::collections::BTreeMap;
+use anyhow::anyhow;
+use bitcoin::{block::Header, p2p::{
+    message_filter::{CFHeaders, CFilter},
+    message_network::VersionMessage,
+}, Block, BlockHash, Network, ScriptBuf, Transaction, Txid};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc::Receiver, Mutex, RwLock};
 use tokio::{
-    select,
     sync::mpsc::{self},
 };
-
-use crate::{
-    chain::{
-        chain::Chain,
-        checkpoints::{HeaderCheckpoint, HeaderCheckpoints},
-        error::HeaderSyncError,
-        HeightMonitor,
-    },
-    core::{error::FetchHeaderError, peer_map::PeerMap},
-    db::traits::{HeaderStore, PeerStore},
-    filters::{cfheader_chain::AppendAttempt, error::CFilterSyncError},
-    RejectPayload, TxBroadcastPolicy,
-};
-
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
+use crate::{chain::{
+    chain::Chain,
+    checkpoints::{HeaderCheckpoint, HeaderCheckpoints},
+    error::HeaderSyncError,
+    HeightMonitor,
+}, core::{error::FetchHeaderError, peer_map::PeerMap}, db::traits::{HeaderStore, PeerStore}, filters::{cfheader_chain::AppendAttempt}, BlockchainInfo, RejectPayload, TxBroadcastPolicy};
+use crate::chain::block_queue::DownloadRequest;
+use crate::chain::chain::AdvanceKind;
+use crate::core::error::{DownloadRequestError};
+use crate::core::peer_map::DownloadResponseKind;
+use crate::db::sqlite::blocks::BlocksStore;
+use crate::db::sqlite::filters::FiltersStore;
+use crate::rpc::server::MempoolEntryResult;
 use super::{
     broadcaster::Broadcaster,
     channel_messages::{
-        CombinedAddr, GetBlockConfig, GetHeaderConfig, MainThreadMessage, PeerMessage,
+        CombinedAddr, GetHeaderConfig, MainThreadMessage, PeerMessage,
         PeerThreadMessage,
     },
     client::Client,
@@ -56,32 +53,50 @@ pub enum NodeState {
     HeadersSynced,
     /// We may start scanning compact block filters.
     FilterHeadersSynced,
-    /// We may start asking for blocks with matches.
-    FiltersSynced,
-    /// We found all known transactions to the wallet.
-    TransactionsSynced,
 }
 
 /// A compact block filter node. Nodes download Bitcoin block headers, block filters, and blocks to send relevant events to a client.
-#[derive(Debug)]
-pub struct Node<H: HeaderStore, P: PeerStore> {
+#[derive(Debug, Clone)]
+pub struct Node<H: HeaderStore, P: PeerStore, B: BlocksStore + 'static, F: FiltersStore + 'static> {
     state: Arc<RwLock<NodeState>>,
-    chain: Arc<Mutex<Chain<H>>>,
+    chain: Arc<Mutex<Chain<H, B, F>>>,
     peer_map: Arc<Mutex<PeerMap<P>>>,
     tx_broadcaster: Arc<Mutex<Broadcaster>>,
+    // A partial mempool of transactions we have broadcasted
+    mempool: Arc<Mutex<Vec<MempoolTransaction>>>,
     required_peers: PeerRequirement,
     dialog: Arc<Dialog>,
     client_recv: Arc<Mutex<Receiver<ClientMessage>>>,
     peer_recv: Arc<Mutex<Receiver<PeerThreadMessage>>>,
     filter_sync_policy: Arc<RwLock<FilterSyncPolicy>>,
+    queued_blocks: Arc<Mutex<QueueBlocksStatus>>,
+    checkpoint: HeaderCheckpoint,
 }
 
-impl<H: HeaderStore, P: PeerStore> Node<H, P> {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+// status for on demand blocks
+pub struct QueueBlocksStatus {
+    pending: u32,
+    completed: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct MempoolTransaction {
+    tx: Transaction,
+    txid: Txid,
+    last_seen: Option<Instant>,
+    broadcast: Instant,
+    last_check: Instant,
+}
+
+impl<H: HeaderStore + 'static, P: PeerStore + 'static, B: BlocksStore + 'static + Send, F: FiltersStore + 'static> Node<H, P, B, F> {
     pub(crate) fn new(
         network: Network,
         config: NodeConfig,
         peer_store: P,
         header_store: H,
+        block_store: B,
+        filter_store: F,
     ) -> (Self, Client) {
         let NodeConfig {
             required_peers,
@@ -96,6 +111,8 @@ impl<H: HeaderStore, P: PeerStore> Node<H, P> {
             max_connection_time,
             filter_sync_policy,
             log_level,
+            prune_point,
+            cf_headers_path
         } = config;
         let timeout_config = PeerTimeoutConfig::new(response_timeout, max_connection_time);
         // Set up a communication channel between the node and client
@@ -112,16 +129,9 @@ impl<H: HeaderStore, P: PeerStore> Node<H, P> {
         let (mtx, mrx) = mpsc::channel::<PeerThreadMessage>(32);
         let height_monitor = Arc::new(Mutex::new(HeightMonitor::new()));
         let peer_map = Arc::new(Mutex::new(PeerMap::new(
-            mtx,
-            network,
-            peer_store,
-            white_list,
-            Arc::clone(&dialog),
-            connection_type,
-            target_peer_size,
-            timeout_config,
-            Arc::clone(&height_monitor),
-            dns_resolver,
+            mtx, network, peer_store, white_list,
+            Arc::clone(&dialog), connection_type, target_peer_size,
+            timeout_config, Arc::clone(&height_monitor), dns_resolver,
         )));
         // Set up the transaction broadcaster
         let tx_broadcaster = Arc::new(Mutex::new(Broadcaster::new()));
@@ -138,7 +148,11 @@ impl<H: HeaderStore, P: PeerStore> Node<H, P> {
             Arc::clone(&dialog),
             height_monitor,
             header_store,
+            block_store,
+            filter_store,
+            cf_headers_path,
             required_peers.into(),
+            prune_point,
         );
         let chain = Arc::new(Mutex::new(chain));
         (
@@ -147,11 +161,14 @@ impl<H: HeaderStore, P: PeerStore> Node<H, P> {
                 chain,
                 peer_map,
                 tx_broadcaster,
+                mempool: Arc::new(Default::default()),
                 required_peers: required_peers.into(),
                 dialog,
                 client_recv: Arc::new(Mutex::new(crx)),
                 peer_recv: Arc::new(Mutex::new(mrx)),
                 filter_sync_policy: Arc::new(RwLock::new(filter_sync_policy)),
+                queued_blocks: Arc::new(Mutex::new(QueueBlocksStatus { pending: 0, completed: 0 })),
+                checkpoint,
             },
             client,
         )
@@ -162,166 +179,301 @@ impl<H: HeaderStore, P: PeerStore> Node<H, P> {
     /// # Errors
     ///
     /// A node will cease running if a fatal error is encountered with either the [`PeerStore`] or [`HeaderStore`].
-    pub async fn run(&self) -> Result<(), NodeError<H::Error, P::Error>> {
+    pub async fn run(self: Arc<Self>) -> Result<(), NodeError<H::Error, P::Error>> {
         crate::log!(self.dialog, "Starting node");
         crate::log!(
-            self.dialog,
-            format!(
-                "Configured connection requirement: {} peers",
-                self.required_peers
-            )
-        );
+        self.dialog,
+        format!(
+            "Configured connection requirement: {} peers",
+            self.required_peers
+        )
+    );
         self.fetch_headers().await?;
         let mut last_block = LastBlockMonitor::new();
         let mut peer_recv = self.peer_recv.lock().await;
-        let mut client_recv = self.client_recv.lock().await;
+
+        let shutdown_token = CancellationToken::new();
+        let shutdown_token_client = shutdown_token.clone();
+        let shutdown_token_node = shutdown_token.clone();
+
+        let that = self.clone();
+
+        tokio::task::spawn(async move {
+            _ = that.client_messages_task(shutdown_token_client).await;
+        });
+
         loop {
-            // Try to advance the state of the node
+            if shutdown_token_node.is_cancelled() {
+                return Ok(());
+            }
+
             self.advance_state(&mut last_block).await;
-            // Connect to more peers if we need them and remove old connections
             self.dispatch().await?;
-            // If there are blocks we need in the queue, we should request them of a random peer
-            self.get_blocks().await;
-            // If we have a transaction to broadcast and we are connected to peers, we should broadcast them
+            self.request_next_block_batch().await;
             self.broadcast_transactions().await;
-            // Either handle a message from a remote peer or from our client
-            select! {
-                peer = tokio::time::timeout(Duration::from_secs(LOOP_TIMEOUT), peer_recv.recv()) => {
-                    match peer {
-                        Ok(Some(peer_thread)) => {
-                            match peer_thread.message {
-                                PeerMessage::Version(version) => {
-                                    {
-                                        let mut peer_map = self.peer_map.lock().await;
-                                        peer_map.set_offset(peer_thread.nonce, version.timestamp);
-                                        peer_map.set_services(peer_thread.nonce, version.services);
-                                        peer_map.set_height(peer_thread.nonce, version.start_height as u32).await;
-                                    }
-                                    let response = self.handle_version(peer_thread.nonce, version).await?;
-                                    self.send_message(peer_thread.nonce, response).await;
-                                    crate::log!(self.dialog, format!("[{}]: version", peer_thread.nonce));
-                                }
-                                PeerMessage::Addr(addresses) => self.handle_new_addrs(addresses).await,
-                                PeerMessage::Headers(headers) => {
-                                    last_block.reset();
-                                    crate::log!(self.dialog, format!("[{}]: headers", peer_thread.nonce));
-                                    match self.handle_headers(peer_thread.nonce, headers).await {
-                                        Some(response) => {
-                                            self.send_message(peer_thread.nonce, response).await;
-                                        }
-                                        None => continue,
-                                    }
-                                }
-                                PeerMessage::FilterHeaders(cf_headers) => {
-                                    crate::log!(self.dialog, format!("[{}]: filter headers", peer_thread.nonce));
-                                    match self.handle_cf_headers(peer_thread.nonce, cf_headers).await {
-                                        Some(response) => {
-                                            self.broadcast(response).await;
-                                        }
-                                        None => continue,
-                                    }
-                                }
-                                PeerMessage::Filter(filter) => {
-                                    match self.handle_filter(peer_thread.nonce, filter).await {
-                                        Some(response) => {
-                                            self.send_message(peer_thread.nonce, response).await;
-                                        }
-                                        None => continue,
-                                    }
-                                }
-                                PeerMessage::Block(block) => match self.handle_block(peer_thread.nonce, block).await {
-                                    Some(response) => {
-                                        self.send_message(peer_thread.nonce, response).await;
-                                    }
-                                    None => continue,
-                                },
-                                PeerMessage::NewBlocks(blocks) => {
-                                    crate::log!(self.dialog, format!("[{}]: inv", peer_thread.nonce));
-                                    match self.handle_inventory_blocks(peer_thread.nonce, blocks).await {
-                                        Some(response) => {
-                                            self.broadcast(response).await;
-                                        }
-                                        None => continue,
-                                    }
-                                }
-                                PeerMessage::Reject(payload) => {
-                                    self.dialog
-                                        .send_warning(Warning::TransactionRejected { payload });
-                                }
-                                PeerMessage::FeeFilter(feerate) => {
-                                    let mut peer_map = self.peer_map.lock().await;
-                                    peer_map.set_broadcast_min(peer_thread.nonce, feerate);
-                                }
-                                _ => continue,
+
+            let peer = tokio::time::timeout(
+                Duration::from_secs(LOOP_TIMEOUT), peer_recv.recv(),
+            ).await;
+            match peer {
+                Ok(Some(peer_thread)) => {
+                    match peer_thread.message {
+                        PeerMessage::Version(version) => {
+                            {
+                                let mut peer_map = self.peer_map.lock().await;
+                                peer_map.set_offset(peer_thread.nonce, version.timestamp);
+                                peer_map.set_services(peer_thread.nonce, version.services);
+                                peer_map.set_height(peer_thread.nonce, version.start_height as u32).await;
                             }
-                        },
-                        _ => continue,
-                    }
-                },
-                message = client_recv.recv() => {
-                    if let Some(message) = message {
-                        match message {
-                            ClientMessage::Shutdown => return Ok(()),
-                            ClientMessage::Broadcast(transaction) => self.tx_broadcaster.lock().await.add(transaction),
-                            ClientMessage::AddScript(script) =>  self.add_script(script).await,
-                            ClientMessage::Rescan => {
-                                if let Some(response) = self.rescan().await {
+                            let response = self.handle_version(peer_thread.nonce, version).await?;
+                            self.send_message(peer_thread.nonce, response).await;
+                            crate::log!(self.dialog, format!("[{}]: version", peer_thread.nonce));
+                        }
+                        PeerMessage::Addr(addresses) => self.handle_new_addrs(addresses).await,
+                        PeerMessage::Headers(headers) => {
+                            last_block.reset();
+                            crate::log!(self.dialog, format!("[{}]: headers", peer_thread.nonce));
+                            match self.handle_headers(peer_thread.nonce, headers).await {
+                                Some(response) => {
+                                    self.send_message(peer_thread.nonce, response).await;
+                                }
+                                None => continue,
+                            }
+                        }
+                        PeerMessage::FilterHeaders(cf_headers) => {
+                            crate::log!(self.dialog, format!("[{}]: filter headers", peer_thread.nonce));
+                            match self.handle_cf_headers(peer_thread.nonce, cf_headers).await {
+                                Some(response) => {
                                     self.broadcast(response).await;
                                 }
-                            },
-                            ClientMessage::ContinueDownload => {
-                                if let Some(response) = self.start_filter_download().await {
-                                    self.broadcast(response).await
-                                }
-                            },
-                            #[cfg(feature = "filter-control")]
-                            ClientMessage::GetBlock(hash) => {
-                                let mut state = self.state.write().await;
-                                if matches!(*state, NodeState::TransactionsSynced) {
-                                    *state = NodeState::FiltersSynced
-                                }
-                                drop(state);
-                                let mut chain = self.chain.lock().await;
-                                chain.get_block(hash).await;
-                            },
-                            ClientMessage::SetDuration(duration) => {
-                                let mut peer_map = self.peer_map.lock().await;
-                                peer_map.set_duration(duration);
-                            },
-                            ClientMessage::AddPeer(peer) => {
-                                let mut peer_map = self.peer_map.lock().await;
-                                peer_map.add_trusted_peer(peer);
-                            },
-                            ClientMessage::GetHeader(request) => {
-                                let mut chain = self.chain.lock().await;
-                                let header_opt = chain.fetch_header(request.height).await.map_err(|e| FetchHeaderError::DatabaseOptFailed { error: e.to_string() }).and_then(|opt| opt.ok_or(FetchHeaderError::UnknownHeight));
-                                let send_result = request.oneshot.send(header_opt);
-                                if send_result.is_err() {
-                                    self.dialog.send_warning(Warning::ChannelDropped);
-                                };
-                            },
-                            ClientMessage::GetHeaderBatch(request) => {
-                                let chain = self.chain.lock().await;
-                                let range_opt = chain.fetch_header_range(request.range).await.map_err(|e| FetchHeaderError::DatabaseOptFailed { error: e.to_string() });
-                                let send_result = request.oneshot.send(range_opt);
-                                if send_result.is_err() {
-                                    self.dialog.send_warning(Warning::ChannelDropped);
-                                };
-                            },
-                            ClientMessage::GetBroadcastMinFeeRate(request) => {
-                                let peer_map = self.peer_map.lock().await;
-                                let fee_rate = peer_map.broadcast_min();
-                                let send_result = request.send(fee_rate);
-                                if send_result.is_err() {
-                                    self.dialog.send_warning(Warning::ChannelDropped);
-                                };
+                                None => continue,
                             }
-                            ClientMessage::NoOp => (),
                         }
+                        PeerMessage::Filter(filter) => {
+                            crate::log!(self.dialog, format!("{} sent filter {}", peer_thread.nonce, filter.block_hash));
+
+                            match self.handle_filter(peer_thread.nonce, filter).await {
+                                Some(response) => {
+                                    self.send_message(peer_thread.nonce, response).await;
+                                }
+                                None => continue,
+                            }
+                        }
+                        PeerMessage::Tx(tx) => {
+                            let txid = tx.compute_txid();
+                            crate::log!(self.dialog, format!("{} sent tx {}", peer_thread.nonce, txid));
+                            // Refresh the last seen to keep them in our mempool
+                            let mut mem = self.mempool.lock().await;
+                            if let Some(mem_tx) = mem.iter_mut()
+                                .find(|m| m.txid == txid) {
+                                mem_tx.last_seen = Some(Instant::now());
+                            }
+                            continue;
+                        }
+                        PeerMessage::Block(block) => {
+                            crate::log!(self.dialog, format!("{} sent block {}", peer_thread.nonce, block.block_hash()));
+                            match self.handle_block(peer_thread.nonce, block).await {
+                                Some(response) => {
+                                    self.send_message(peer_thread.nonce, response).await;
+                                }
+                                None => {
+                                    continue;
+                                }
+                            }
+                        }
+                        PeerMessage::NewBlocks(blocks) => {
+                            crate::log!(self.dialog, format!("[{}]: inv", peer_thread.nonce));
+                            match self.handle_inventory_blocks(peer_thread.nonce, blocks).await {
+                                Some(response) => {
+                                    self.broadcast(response).await;
+                                }
+                                None => continue,
+                            }
+                        }
+                        PeerMessage::Reject(payload) => {
+                            self.mempool.lock().await.retain(|tx| tx.tx.compute_txid() != payload.txid);
+                            self.dialog
+                                .send_warning(Warning::TransactionRejected { payload });
+                        }
+                        PeerMessage::FeeFilter(feerate) => {
+                            let mut peer_map = self.peer_map.lock().await;
+                            peer_map.set_broadcast_min(peer_thread.nonce, feerate);
+                        }
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    async fn client_messages_task(&self, cancellation_token: CancellationToken) -> Result<(), NodeError<H::Error, P::Error>> {
+        'main: loop {
+            if cancellation_token.is_cancelled() {
+                break;
+            }
+
+            let mut client_recv = self.client_recv.lock().await;
+            while let Some(message) = client_recv.recv().await {
+                if cancellation_token.is_cancelled() {
+                    break;
+                }
+
+                match message {
+                    ClientMessage::Shutdown => {
+                        cancellation_token.cancel();
+                        return Ok(());
+                    }
+                    ClientMessage::Broadcast(transaction) => self.tx_broadcaster.lock().await.add(transaction),
+                    ClientMessage::AddScript(script) => self.add_script(script).await,
+                    ClientMessage::Rescan => {
+                        if let Some(response) = self.rescan().await {
+                            self.broadcast(response).await;
+                        }
+                    }
+                    ClientMessage::ContinueDownload => {
+                        if let Some(response) = self.start_filter_download().await {
+                            self.broadcast(response).await
+                        }
+                    }
+                    ClientMessage::GetBlock(reqs) => {
+                        let chain_clone = self.chain.clone();
+                        tokio::spawn(async move {
+                            for req in reqs {
+                                let block = chain_clone.lock().await
+                                    .get_block(&req.hash).await;
+                                _ = req.oneshot.send(match block {
+                                    Ok(Some(b)) => Ok(b),
+                                    Ok(None) => Err(DownloadRequestError::UnknownHash),
+                                    _ => Err(DownloadRequestError::RecvError)
+                                });
+                            }
+                        });
+                    }
+                    ClientMessage::SetDuration(duration) => {
+                        let mut peer_map = self.peer_map.lock().await;
+                        peer_map.set_duration(duration);
+                    }
+                    ClientMessage::AddPeer(peer) => {
+                        let mut peer_map = self.peer_map.lock().await;
+                        peer_map.add_trusted_peer(peer);
+                    }
+                    ClientMessage::GetHeader(request) => {
+                        let mut chain = self.chain.lock().await;
+                        let header_opt = chain.fetch_header(request.height)
+                            .await
+                            .map_err(|e| FetchHeaderError::DatabaseOptFailed { error: e.to_string() })
+                            .and_then(|opt| opt.ok_or(FetchHeaderError::UnknownHeight(request.height)));
+                        let send_result = request.oneshot.send(header_opt);
+                        if send_result.is_err() {
+                            self.dialog.send_warning(Warning::ChannelDropped);
+                        };
+                    }
+                    ClientMessage::GetHeaderByHash(request) => {
+                        let mut chain = self.chain.lock().await;
+                        if let Some(height) = chain.height_of_hash(request.hash).await {
+                            let header_opt = chain.fetch_header(height)
+                                .await
+                                .map_err(|e| FetchHeaderError::DatabaseOptFailed { error: e.to_string() })
+                                .and_then(|opt| opt.ok_or(FetchHeaderError::UnknownHeight(height)));
+                            let send_result = request.oneshot.send(header_opt);
+                            if send_result.is_err() {
+                                self.dialog.send_warning(Warning::ChannelDropped);
+                            };
+                        } else {
+                            _ = request.oneshot.send(Err(FetchHeaderError::DatabaseOptFailed {
+                                error: format!("no header with hash {} found", request.hash)
+                            }));
+                        }
+                    }
+                    ClientMessage::GetHeaderBatch(request) => {
+                        let chain = self.chain.lock().await;
+                        let range_opt = chain.fetch_header_range(request.range)
+                            .await
+                            .map_err(|e| FetchHeaderError::DatabaseOptFailed { error: e.to_string() });
+                        let send_result = request.oneshot.send(range_opt);
+                        if send_result.is_err() {
+                            self.dialog.send_warning(Warning::ChannelDropped);
+                        };
+                    }
+                    ClientMessage::GetBlockchainInfo(request) => {
+                        _ = request.oneshot.send(self.fetch_blockchain_info().await);
+                    }
+                    ClientMessage::GetBroadcastMinFeeRate(request) => {
+                        let peer_map = self.peer_map.lock().await;
+                        let fee_rate = peer_map.broadcast_min();
+                        let send_result = request.send(fee_rate);
+                        if send_result.is_err() {
+                            self.dialog.send_warning(Warning::ChannelDropped);
+                        }
+                    }
+                    ClientMessage::NoOp => (),
+                    ClientMessage::GetMempoolEntry(request) => {
+                        match self.mempool.lock().await.iter()
+                            .find(|tx| tx.tx.compute_txid() == request.txid) {
+                            None => {
+                                _ = request.oneshot.send(None);
+                            }
+                            Some(entry) => {
+                                if entry.last_seen.is_none() {
+                                    _ = request.oneshot.send(None);
+                                    continue;
+                                }
+
+                                let result = MempoolEntryResult::default();
+                                _ = request.oneshot.send(Some(result));
+                            }
+                        }
+                    }
+                    ClientMessage::GetBlockFilterByHeight(bfr) => {
+                        let result = self.chain.lock().await
+                            .get_block_filter_by_height(bfr.height).await;
+                        _ = bfr.oneshot.send(result
+                            .map_err(|_| FetchHeaderError::DatabaseOptFailed { error: "no filter ".to_string() }));
+                    }
+                    ClientMessage::QueueBlocks(queue) => {
+                        let mut result = self.chain.lock().await;
+                        let mut headers = Vec::new();
+                        let count = queue.blocks.len();
+                        for height in queue.blocks {
+                            match result.fetch_header(height).await {
+                                Ok(Some(header)) => {
+                                    headers.push((height, header));
+                                }
+                                Ok(None) => {
+                                    _ = queue.oneshot.send(Err(anyhow!("No such header at height = {}", height)));
+                                    continue 'main;
+                                }
+                                Err(err) => {
+                                    _ = queue.oneshot.send(Err(anyhow!("Could not fetch header: {}", err.to_string())));
+                                    continue 'main;
+                                }
+                            }
+                        }
+
+                        self.peer_map.lock().await
+                            .queue_blocks(headers.into_iter().map(|(height, header)| {
+                                DownloadRequest {
+                                    hash: header.block_hash(),
+                                    kind: AdvanceKind::Blocks,
+                                    height,
+                                    sender: None,
+                                    downloading_since: None,
+                                }
+                            }).collect());
+
+                        {
+                            let mut status = self.queued_blocks.lock().await;
+                            status.pending += count as u32;
+                        }
+
+                        self.dialog.send_dialog(format!("Queued {} blocks", count)).await;
+                        _ = queue.oneshot.send(Ok(()));
                     }
                 }
             }
         }
+        Ok(())
     }
 
     // Send a message to a specified peer
@@ -337,15 +489,17 @@ impl<H: HeaderStore, P: PeerStore> Node<H, P> {
     }
 
     // Send a message to a random peer
-    async fn send_random(&self, message: MainThreadMessage) {
+    #[allow(dead_code)]
+    async fn send_random(&self, message: MainThreadMessage) -> Option<PeerId> {
         let mut peer_map = self.peer_map.lock().await;
-        peer_map.send_random(message).await;
+        peer_map.send_random(message).await
     }
 
     // Connect to a new peer if we are not connected to enough
     async fn dispatch(&self) -> Result<(), NodeError<H::Error, P::Error>> {
         let mut peer_map = self.peer_map.lock().await;
         peer_map.clean().await;
+
         let live = peer_map.live();
         let required = self.next_required_peers().await;
         // Find more peers when lower than the desired threshold.
@@ -362,24 +516,87 @@ impl<H: HeaderStore, P: PeerStore> Node<H, P> {
         Ok(())
     }
 
-    // If there are blocks in the queue, we should request them of a random peer
-    async fn get_blocks(&self) {
-        if let Some(block_request) = self.pop_block_queue().await {
-            crate::log!(self.dialog, "Sending block request to random peer");
-            self.send_random(block_request).await;
+    async fn request_next_block_batch(&self) {
+        let state = self.state.read().await;
+        if matches!(*state, NodeState::Behind) {
+            return;
         }
+
+        let mut chain = self.chain.lock().await;
+        let can_sync_filters = chain.can_sync_filters;
+
+        // Once filter sync is initiated, it must be completed before syncing
+        // blocks again.
+        let blocks_synced = chain.blocks_synced().await;
+        let filter_sync = (blocks_synced || can_sync_filters) &&
+            !chain.filters_synced().await &&
+            matches!(*self.filter_sync_policy.read().await, FilterSyncPolicy::Continue);
+        if blocks_synced {
+            chain.can_sync_filters = true;
+        }
+
+        if self.peer_map.lock().await.reset_peers(filter_sync).await {
+            _ = self.dispatch().await;
+        }
+
+        let to_queue =
+            chain.advance_downloads_tip(filter_sync).await;
+
+        drop(chain);
+
+        match to_queue {
+            Ok(queue) => {
+                if !queue.is_empty() {
+                    crate::log!(self.dialog, format!("Queueing {} items", queue.len()));
+                    self.peer_map.lock().await.queue_blocks(queue);
+                }
+            }
+            Err(err) => {
+                crate::log!(self.dialog, format!("Could not advance tips: {}", err));
+            }
+        }
+
+        self.peer_map.lock().await.request_next_download_batch().await;
+
     }
 
     // Broadcast transactions according to the configured policy
     async fn broadcast_transactions(&self) {
         let mut broadcaster = self.tx_broadcaster.lock().await;
-        if broadcaster.is_empty() {
-            return;
-        }
         let mut peer_map = self.peer_map.lock().await;
         if peer_map.live().ge(&self.required_peers) {
+            // Observe the transactions we have broadcasted by asking other peers
+            // to see if they're still being held in their mempool.
+            // This is to lossely detect if they have been replaced/or mined.
+            // (We don't have a good view of the mempool in general)
+            {
+                const CHECK_PEERS_MEMPOOL_INTERVAL: Duration = Duration::from_secs(28);
+                let mempool_txs: Vec<_> = {
+                    let mut mempool = self.mempool
+                        .lock().await;
+                    mempool.iter_mut()
+                        .filter(|m| m.last_check.elapsed() > CHECK_PEERS_MEMPOOL_INTERVAL)
+                        .map(|m| {
+                            m.last_check = Instant::now();
+                            m.txid
+                        }).collect()
+                };
+                if !mempool_txs.is_empty() {
+                    // Ask peers for the transactions that were broadcasted to see if they're still in mempool.
+                    _ = peer_map.broadcast(MainThreadMessage::GetTx(mempool_txs)).await;
+                }
+                // Clear all transactions that appear to be removed
+                const LAST_SEEN_IN_MEMPOOL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+                let mut mempool = self.mempool.lock().await;
+                mempool
+                    .retain(|m|
+                        m.last_seen.as_ref().unwrap_or(&m.broadcast).elapsed() < LAST_SEEN_IN_MEMPOOL_TIMEOUT
+                    );
+            }
+
             for transaction in broadcaster.queue() {
                 let txid = transaction.tx.compute_txid();
+                let tx = transaction.tx.clone();
                 let did_broadcast = match transaction.broadcast_policy {
                     TxBroadcastPolicy::AllPeers => {
                         crate::log!(
@@ -394,10 +611,17 @@ impl<H: HeaderStore, P: PeerStore> Node<H, P> {
                         crate::log!(self.dialog, "Sending transaction to a random peer");
                         peer_map
                             .send_random(MainThreadMessage::BroadcastTx(transaction.tx))
-                            .await
+                            .await.is_some()
                     }
                 };
                 if did_broadcast {
+                    self.mempool.lock().await.push(MempoolTransaction {
+                        tx,
+                        txid,
+                        last_seen: None,
+                        broadcast: Instant::now(),
+                        last_check: Instant::now(),
+                    });
                     self.dialog.send_info(Log::TxSent(txid)).await;
                 } else {
                     self.dialog.send_warning(Warning::TransactionRejected {
@@ -424,46 +648,39 @@ impl<H: HeaderStore, P: PeerStore> Node<H, P> {
             }
             NodeState::HeadersSynced => {
                 let header_chain = self.chain.lock().await;
-                if header_chain.is_cf_headers_synced() {
-                    self.dialog
-                        .send_info(Log::StateChange(NodeState::FilterHeadersSynced))
-                        .await;
-                    *state = NodeState::FilterHeadersSynced;
-                }
-            }
-            NodeState::FilterHeadersSynced => {
-                let header_chain = self.chain.lock().await;
-                if header_chain.is_filters_synced() {
-                    self.dialog
-                        .send_info(Log::StateChange(NodeState::FiltersSynced))
-                        .await;
-                    *state = NodeState::FiltersSynced;
-                }
-            }
-            NodeState::FiltersSynced => {
-                let header_chain = self.chain.lock().await;
-                if header_chain.block_queue_empty() {
-                    *state = NodeState::TransactionsSynced;
+                if header_chain.is_synced().await {
                     let update = SyncUpdate::new(
                         HeaderCheckpoint::new(header_chain.height(), header_chain.tip()),
                         header_chain.last_ten(),
                     );
+                    self.dialog.send_event(Event::HeadersSynced(update));
+                }
+
+                if header_chain.is_cf_headers_synced() {
                     self.dialog
-                        .send_info(Log::StateChange(NodeState::TransactionsSynced))
+                        .send_info(Log::StateChange(NodeState::FilterHeadersSynced))
                         .await;
-                    self.dialog.send_event(Event::Synced(update));
+                    if let Err(e) = header_chain.save_cf_headers().await {
+                        self.dialog
+                            .send_dialog(format!("Could not save cf headers chain: {}", e))
+                            .await;
+                    }
+
+                    *state = NodeState::FilterHeadersSynced;
                 }
             }
-            NodeState::TransactionsSynced => {
-                if last_block.stale() {
-                    self.dialog.send_warning(Warning::PotentialStaleTip);
-                    crate::log!(
+            NodeState::FilterHeadersSynced => {}
+        }
+
+        if !matches!(*state, NodeState::Behind) {
+            if last_block.stale() {
+                self.dialog.send_warning(Warning::PotentialStaleTip);
+                crate::log!(
                         self.dialog,
                         "Disconnecting from remote nodes to find new connections"
                     );
-                    self.broadcast(MainThreadMessage::Disconnect).await;
-                    last_block.reset();
-                }
+                self.broadcast(MainThreadMessage::Disconnect).await;
+                last_block.reset();
             }
         }
     }
@@ -479,24 +696,19 @@ impl<H: HeaderStore, P: PeerStore> Node<H, P> {
 
     // After we receiving some chain-syncing message, we decide what chain of data needs to be
     // requested next.
-    async fn next_stateful_message(&self, chain: &mut Chain<H>) -> Option<MainThreadMessage> {
+    async fn next_stateful_message(&self, chain: &mut Chain<H, B, F>) -> Option<MainThreadMessage> {
         if !chain.is_synced().await {
             let headers = GetHeaderConfig {
                 locators: chain.locators().await,
                 stop_hash: None,
             };
-            return Some(MainThreadMessage::GetHeaders(headers));
-        } else if !chain.is_cf_headers_synced() {
+            return Some(MainThreadMessage::GetHeaders(headers))
+        }
+
+        if chain.can_sync_filters && !chain.is_cf_headers_synced() {
             return Some(MainThreadMessage::GetFilterHeaders(
                 chain.next_cf_header_message().await,
             ));
-        } else if !chain.is_filters_synced() {
-            let filter_download = self.filter_sync_policy.read().await;
-            if matches!(*filter_download, FilterSyncPolicy::Continue) {
-                return Some(MainThreadMessage::GetFilters(
-                    chain.next_filter_message().await,
-                ));
-            }
         }
         None
     }
@@ -514,10 +726,9 @@ impl<H: HeaderStore, P: PeerStore> Node<H, P> {
         match *state {
             NodeState::Behind => (),
             _ => {
-                if !version_message.services.has(ServiceFlags::COMPACT_FILTERS)
-                    || !version_message.services.has(ServiceFlags::NETWORK)
-                {
-                    self.dialog.send_warning(Warning::NoCompactFilters);
+                let services = self.peer_map.lock().await.required_services;
+                if !version_message.services.has(services) {
+                    self.dialog.send_warning(Warning::NoRequiredServices);
                     return Ok(MainThreadMessage::Disconnect);
                 }
             }
@@ -556,6 +767,7 @@ impl<H: HeaderStore, P: PeerStore> Node<H, P> {
         Ok(MainThreadMessage::GetHeaders(next_headers))
     }
 
+
     // Handle new addresses gossiped over the p2p network
     async fn handle_new_addrs(&self, new_peers: Vec<CombinedAddr>) {
         crate::log!(
@@ -573,8 +785,11 @@ impl<H: HeaderStore, P: PeerStore> Node<H, P> {
         headers: Vec<Header>,
     ) -> Option<MainThreadMessage> {
         let mut chain = self.chain.lock().await;
-        if let Err(e) = chain.sync_chain(headers).await {
-            match e {
+        match chain.sync_chain(headers).await {
+            Ok(disconnected_blocks) => {
+                self.peer_map.lock().await.cancel_blocks(&disconnected_blocks);
+            }
+            Err(e) => match e {
                 HeaderSyncError::EmptyMessage => {
                     if !chain.is_synced().await {
                         return Some(MainThreadMessage::Disconnect);
@@ -597,6 +812,8 @@ impl<H: HeaderStore, P: PeerStore> Node<H, P> {
                 }
             }
         }
+
+
         self.next_stateful_message(chain.deref_mut()).await
     }
 
@@ -630,60 +847,75 @@ impl<H: HeaderStore, P: PeerStore> Node<H, P> {
         }
     }
 
+
+    async fn fetch_blockchain_info(&self) -> Result<BlockchainInfo, FetchHeaderError> {
+        let chain = self.chain.lock().await;
+        let chain_work = chain.chainwork();
+        let headers = chain.height();
+
+        let best_hash = chain.tip();
+        let cf_filter_headers = chain.cf_headers_height();
+
+        // try to fetch both tips, bailing out early on error
+        let blocks_tip = chain
+            .blocks_tip()
+            .await.map(|t| t.height).unwrap_or(0);
+
+        let filters_tip = chain
+            .filters_tip()
+            .await;
+
+        Ok(BlockchainInfo {
+            chain: "main".to_string(),
+            blocks: if blocks_tip > headers { 0 } else { blocks_tip },
+            headers,
+            filters: filters_tip.map(|t| t.height).unwrap_or(0),
+            filter_headers: cf_filter_headers,
+            chain_work,
+            checkpoint: self.checkpoint,
+            prune_height: chain.prune_height,
+            best_blockhash: Some(best_hash),
+            median_time: 0,
+            block_queue: self.queued_blocks.lock().await.clone(),
+            pruned: true,
+        })
+    }
+
     // Handle a new compact block filter
     async fn handle_filter(&self, peer_id: PeerId, filter: CFilter) -> Option<MainThreadMessage> {
-        let mut chain = self.chain.lock().await;
-        match chain.sync_filter(filter).await {
-            Ok(potential_message) => potential_message.map(MainThreadMessage::GetFilters),
-            Err(e) => {
-                self.dialog.send_warning(Warning::UnexpectedSyncError {
-                    warning: format!("Compact filter syncing encountered an error: {}", e),
-                });
-                match e {
-                    CFilterSyncError::Filter(_) => Some(MainThreadMessage::Disconnect),
-                    _ => {
-                        let mut lock = self.peer_map.lock().await;
-                        lock.ban(peer_id).await;
-                        Some(MainThreadMessage::Disconnect)
-                    }
-                }
-            }
-        }
+        // TODO: verify this is a filter we want
+        let mut lock = self.peer_map.lock().await;
+        lock.receive_download(peer_id, DownloadResponseKind::Filter(filter)).await;
+        None
     }
 
     // Scan a block for transactions.
     async fn handle_block(&self, peer_id: PeerId, block: Block) -> Option<MainThreadMessage> {
-        let mut chain = self.chain.lock().await;
-        if let Err(e) = chain.check_send_block(block).await {
-            self.dialog.send_warning(Warning::UnexpectedSyncError {
-                warning: format!("Unexpected block scanning error: {}", e),
-            });
+        let block = {
             let mut lock = self.peer_map.lock().await;
-            lock.ban(peer_id).await;
-            return Some(MainThreadMessage::Disconnect);
-        }
-        None
-    }
+            lock.receive_download(peer_id, DownloadResponseKind::Block(block)).await
+        };
 
-    // The block queue holds all the block hashes we may be interested in
-    async fn pop_block_queue(&self) -> Option<MainThreadMessage> {
-        let state = self.state.read().await;
-        if matches!(
-            *state,
-            NodeState::FilterHeadersSynced | NodeState::FiltersSynced
-        ) {
-            let mut chain = self.chain.lock().await;
-            let next_block_hash = chain.next_block();
-            return match next_block_hash {
-                Some(block_hash) => {
-                    crate::log!(self.dialog, format!("Next block in queue: {}", block_hash));
-                    Some(MainThreadMessage::GetBlock(GetBlockConfig {
-                        locator: block_hash,
-                    }))
+        if let Some((height, block)) = block {
+            let mut map = BTreeMap::new();
+            map.insert(height, block);
+            // If the request had no receiver, store the block
+            if !self.chain.lock().await.persister.lock().await.insert(map).await {
+                self.dialog.send_warning(
+                    Warning::FailedPersistence {
+                        warning: format!("Could not insert received block {}", height)
+                    },
+                )
+            } else {
+                self.dialog.send_dialog(format!("Received queued block {}", height)).await;
+                {
+                    let mut status = self.queued_blocks.lock().await;
+                    status.pending -= 1;
+                    status.completed += 1;
                 }
-                None => None,
-            };
+            }
         }
+
         None
     }
 
@@ -742,9 +974,8 @@ impl<H: HeaderStore, P: PeerStore> Node<H, P> {
                     .send_info(Log::StateChange(NodeState::FilterHeadersSynced))
                     .await;
                 *state = NodeState::FilterHeadersSynced;
-                Some(MainThreadMessage::GetFilters(
-                    chain.next_filter_message().await,
-                ))
+                // TODO: clean filters
+                None
             }
         }
     }
@@ -754,15 +985,7 @@ impl<H: HeaderStore, P: PeerStore> Node<H, P> {
         let mut download_policy = self.filter_sync_policy.write().await;
         *download_policy = FilterSyncPolicy::Continue;
         drop(download_policy);
-        let current_state = self.state.read().await;
-        match *current_state {
-            NodeState::Behind => None,
-            NodeState::HeadersSynced => None,
-            _ => {
-                let mut chain = self.chain.lock().await;
-                self.next_stateful_message(chain.deref_mut()).await
-            }
-        }
+        None
     }
 
     // When the application starts, fetch any headers we know about from the database.
@@ -783,13 +1006,11 @@ impl core::fmt::Display for NodeState {
                 write!(f, "Requesting block headers.")
             }
             NodeState::HeadersSynced => {
-                write!(f, "Requesting compact filter headers.")
+                write!(f, "Headers synced.")
             }
             NodeState::FilterHeadersSynced => {
-                write!(f, "Requesting compact block filters.")
+                write!(f, "Filter headers synced.")
             }
-            NodeState::FiltersSynced => write!(f, "Downloading blocks with relevant transactions."),
-            NodeState::TransactionsSynced => write!(f, "Fully synced to the highest block."),
         }
     }
 }

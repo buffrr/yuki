@@ -1,10 +1,6 @@
 use std::net::{IpAddr, SocketAddr};
 use std::{path::PathBuf, time::Duration};
-
-use bitcoin::Network;
-#[cfg(not(feature = "filter-control"))]
-use bitcoin::ScriptBuf;
-
+use bitcoin::{Network};
 use super::{client::Client, config::NodeConfig, node::Node, FilterSyncPolicy};
 #[cfg(feature = "database")]
 use crate::db::error::SqlInitializationError;
@@ -16,13 +12,15 @@ use crate::{
     db::traits::{HeaderStore, PeerStore},
 };
 use crate::{ConnectionType, LogLevel, PeerStoreSizeConfig, TrustedPeer};
+use crate::db::sqlite::blocks::{BlocksStore, SqliteBlockDb};
+use crate::db::sqlite::filters::{FiltersStore, SqliteFilterDb};
 
 #[cfg(feature = "database")]
 /// The default node returned from the [`NodeBuilder`](crate::core).
-pub type NodeDefault = Node<SqliteHeaderDb, SqlitePeerDb>;
+pub type NodeDefault = Node<SqliteHeaderDb, SqlitePeerDb, SqliteBlockDb, SqliteFilterDb>;
 
-const MIN_PEERS: u8 = 1;
-const MAX_PEERS: u8 = 15;
+const MIN_PEERS: u8 = 4;
+const MAX_PEERS: u8 = 125;
 
 /// Build a [`Node`] in an additive way.
 ///
@@ -64,7 +62,6 @@ const MAX_PEERS: u8 = 15;
 /// // Add node preferences and build the node/client
 /// let (mut node, client) = builder
 ///     // The Bitcoin scripts to monitor
-///     .add_scripts(script_set)
 ///     // Only scan blocks strictly after an anchor checkpoint
 ///     .anchor_checkpoint(checkpoint)
 ///     // The number of connections we would like to maintain
@@ -95,16 +92,6 @@ impl NodeBuilder {
     /// Add a preferred peer to try to connect to.
     pub fn add_peer(mut self, trusted_peer: impl Into<TrustedPeer>) -> Self {
         self.config.white_list.push(trusted_peer.into());
-        self
-    }
-
-    /// Add Bitcoin scripts to monitor for. You may add more later with the [`Client`].
-    #[cfg(not(feature = "filter-control"))]
-    pub fn add_scripts(mut self, scripts: impl IntoIterator<Item = ScriptBuf>) -> Self {
-        let script_iter = scripts.into_iter();
-        for script in script_iter {
-            self.config.addresses.insert(script);
-        }
         self
     }
 
@@ -140,6 +127,11 @@ impl NodeBuilder {
     /// If none is provided, the _most recent_ checkpoint will be used.
     pub fn anchor_checkpoint(mut self, checkpoint: impl Into<HeaderCheckpoint>) -> Self {
         self.config.header_checkpoint = Some(checkpoint.into());
+        self
+    }
+
+    pub fn prune_point(mut self, checkpoint: impl Into<HeaderCheckpoint>) -> Self {
+        self.config.prune_point = Some(checkpoint.into());
         self
     }
 
@@ -208,27 +200,49 @@ impl NodeBuilder {
     /// Building a node and client will error if a database connection is denied or cannot be found.
     #[cfg(feature = "database")]
     pub fn build(&mut self) -> Result<(NodeDefault, Client), SqlInitializationError> {
+
         let peer_store = SqlitePeerDb::new(self.network, self.config.data_path.clone())?;
         let header_store = SqliteHeaderDb::new(self.network, self.config.data_path.clone())?;
+        let block_store = SqliteBlockDb::new(self.network, self.config.data_path.clone())?;
+        let filter_store = SqliteFilterDb::new(self.network, self.config.data_path.clone())?;
+        self.config.cf_headers_path = create_cf_headers_path(self.network, self.config.data_path.clone())?;
+
         Ok(Node::new(
             self.network,
             core::mem::take(&mut self.config),
             peer_store,
             header_store,
+            block_store,
+            filter_store,
         ))
     }
 
     /// Consume the node builder by using custom database implementations, receiving a [`Node`] and [`Client`].
-    pub fn build_with_databases<H: HeaderStore + 'static, P: PeerStore + 'static>(
+    pub fn build_with_databases<H: HeaderStore + 'static, P: PeerStore + 'static, B: BlocksStore + 'static + Send, F: FiltersStore + 'static>(
         &mut self,
         peer_store: P,
         header_store: H,
-    ) -> (Node<H, P>, Client) {
+        block_store: B,
+        filter_store: F,
+    ) -> (Node<H, P, B, F>, Client) {
         Node::new(
             self.network,
             core::mem::take(&mut self.config),
             peer_store,
             header_store,
+            block_store,
+            filter_store,
         )
     }
+}
+
+
+fn create_cf_headers_path(network: Network, path: Option<PathBuf>) -> Result<PathBuf, SqlInitializationError> {
+    let mut path = path.unwrap_or_else(|| PathBuf::from("."));
+    path.push("data");
+    path.push(network.to_string());
+    if !path.exists() {
+        std::fs::create_dir_all(&path)?;
+    }
+    Ok(path.join("cf_headers.bin"))
 }
