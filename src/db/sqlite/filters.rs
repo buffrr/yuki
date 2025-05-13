@@ -34,6 +34,12 @@ impl From<rusqlite::Error> for SqlFiltersStoreError {
 pub trait FiltersStore: Debug + Send + Sync {
     type Error;
 
+    fn reload(
+        &self,
+    ) -> FutureResult<(), SqlInitializationError>;
+
+    fn file_path(&self) -> Option<PathBuf>;
+
     /// Insert multiple filters in one transaction.
     fn insert_filters(
         &mut self,
@@ -85,6 +91,7 @@ const META_TABLE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS meta (
 #[derive(Debug)]
 pub struct SqliteFilterDb {
     conn: Arc<Mutex<Connection>>,
+    file_path: PathBuf
 }
 
 impl SqliteFilterDb {
@@ -96,12 +103,19 @@ impl SqliteFilterDb {
         if !path.exists() {
             fs::create_dir_all(&path)?;
         }
-        let conn = Connection::open(path.join(FILE_NAME))?;
-        conn.execute(FILTERS_TABLE_SCHEMA, [])?;
-        conn.execute(META_TABLE_SCHEMA, [])?;
+        let file_path = path.join(FILE_NAME);
+        let conn = Self::open(&file_path)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            file_path
         })
+    }
+
+    fn open(file_path: &PathBuf) -> Result<Connection, SqlInitializationError> {
+        let conn = Connection::open(&file_path)?;
+        conn.execute(FILTERS_TABLE_SCHEMA, [])?;
+        conn.execute(META_TABLE_SCHEMA, [])?;
+        Ok(conn)
     }
 
     async fn set_tip(&mut self, tip: HeaderCheckpoint) -> Result<(), SqlFiltersStoreError> {
@@ -147,6 +161,23 @@ impl SqliteFilterDb {
         })
             .await
             .expect("spawn_blocking failed")
+    }
+
+    async fn reload(&self) -> Result<(), SqlInitializationError> {
+        match Self::open(&self.file_path) {
+            Ok(new_conn) => {
+                let mut guard = self.conn.lock().await;
+                *guard = new_conn;
+                Ok(())
+            }
+            Err(open_err) => {
+                let _ = tokio::fs::remove_file(&self.file_path).await;
+                let fallback_conn = Self::open(&self.file_path)?;
+                let mut guard = self.conn.lock().await;
+                *guard = fallback_conn;
+                Err(open_err)
+            }
+        }
     }
 
     async fn insert_filters(
@@ -267,6 +298,14 @@ impl SqliteFilterDb {
 // ---------- Trait Implementation ----------
 impl FiltersStore for SqliteFilterDb {
     type Error = SqlFiltersStoreError;
+
+    fn file_path(&self) -> Option<PathBuf> {
+        Some(self.file_path.clone())
+    }
+
+    fn reload(&self) -> FutureResult<(), SqlInitializationError> {
+        Box::pin(self.reload())
+    }
 
     fn insert_filters(
         &mut self,

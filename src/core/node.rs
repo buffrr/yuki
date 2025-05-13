@@ -1,6 +1,8 @@
 use std::{ops::DerefMut, sync::Arc, time::Duration};
 use std::collections::BTreeMap;
-use anyhow::anyhow;
+use futures_util::stream::StreamExt;
+use std::path::PathBuf;
+use anyhow::{anyhow, Context};
 use bitcoin::{block::Header, p2p::{
     message_filter::{CFHeaders, CFilter},
     message_network::VersionMessage,
@@ -10,6 +12,7 @@ use tokio::sync::{mpsc::Receiver, Mutex, RwLock};
 use tokio::{
     sync::mpsc::{self},
 };
+use tokio::io::AsyncWriteExt;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use crate::{chain::{
@@ -71,6 +74,9 @@ pub struct Node<H: HeaderStore, P: PeerStore, B: BlocksStore + 'static, F: Filte
     filter_sync_policy: Arc<RwLock<FilterSyncPolicy>>,
     queued_blocks: Arc<Mutex<QueueBlocksStatus>>,
     checkpoint: HeaderCheckpoint,
+    external_filter_endpoint: Option<String>,
+    filter_download: Arc<Mutex<Option<ExternalFilterLoader>>>,
+    filter_download_progress: Arc<Mutex<Option<f32>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,10 +116,12 @@ impl<H: HeaderStore + 'static, P: PeerStore + 'static, B: BlocksStore + 'static 
             response_timeout,
             max_connection_time,
             filter_sync_policy,
+            external_filter_endpoint,
             log_level,
             prune_point,
             cf_headers_path
         } = config;
+
         let timeout_config = PeerTimeoutConfig::new(response_timeout, max_connection_time);
         // Set up a communication channel between the node and client
         let (log_tx, log_rx) = mpsc::channel::<Log>(32);
@@ -139,6 +147,26 @@ impl<H: HeaderStore + 'static, P: PeerStore + 'static, B: BlocksStore + 'static 
         let mut checkpoints = HeaderCheckpoints::new(&network);
         let checkpoint = header_checkpoint.unwrap_or_else(|| checkpoints.last());
         checkpoints.prune_up_to(checkpoint);
+
+        let mut filter_loader = None;
+        if let Some(external) = external_filter_endpoint.clone() {
+            if let Some(filters_path) = filter_store.file_path() {
+                if let Some(prune_point) = prune_point.clone() {
+                    filter_loader = Some(ExternalFilterLoader {
+                        progress: None,
+                        status: FilterLoadStatus::Idle,
+                        endpoint_url: external,
+                        filter_headers_path: cf_headers_path.clone(),
+                        filters_path,
+                        header_checkpoint: checkpoint.clone(),
+                        prune_point,
+                        attempts: 0,
+                        last_attempt: Instant::now(),
+                    })
+                }
+            }
+        }
+
         // Build the chain
         let chain = Chain::new(
             network,
@@ -169,9 +197,76 @@ impl<H: HeaderStore + 'static, P: PeerStore + 'static, B: BlocksStore + 'static 
                 filter_sync_policy: Arc::new(RwLock::new(filter_sync_policy)),
                 queued_blocks: Arc::new(Mutex::new(QueueBlocksStatus { pending: 0, completed: 0 })),
                 checkpoint,
+                external_filter_endpoint,
+                filter_download: Arc::new(Mutex::new(filter_loader)),
+                filter_download_progress: Arc::new(Mutex::new(None)),
             },
             client,
         )
+    }
+
+    async fn maybe_download_filters(&self) {
+        let mut loader = if let Ok(lock) =
+            self.filter_download.try_lock() {
+            lock
+        } else {
+            return;
+        };
+        if !matches!(&*self.filter_sync_policy.read().await , FilterSyncPolicy::External) {
+            return;
+        }
+        let filters_synced = self.chain.lock().await.filters_synced().await;
+        if filters_synced {
+            return;
+        }
+
+        let loader_ref = match loader.as_mut() {
+            Some(loader) => loader,
+            None => return,
+        };
+
+        if matches!(loader_ref.status, FilterLoadStatus::Loaded) {
+            // Complete syncing
+            match self.chain.lock().await.reload_filters().await {
+                Ok(_) => {}
+                Err(e) => {
+                    self.dialog.send_dialog(
+                        format!("Received bad filters from external source, switching to P2P: {}", e))
+                        .await;
+                    let mut policy = self.filter_sync_policy.write().await;
+                    *policy = FilterSyncPolicy::P2P;
+                }
+            }
+            return;
+        }
+
+        drop(loader);
+
+        let downloader = self.filter_download.clone();
+        let sync_policy = self.filter_sync_policy.clone();
+        let download_progress = self.filter_download_progress.clone();
+        let dialog = self.dialog.clone();
+        tokio::spawn(async move {
+            let mut lock = match downloader.try_lock() {
+                Ok(lock) => lock,
+                Err(_) => return
+            };
+            let loader = match lock.as_mut() {
+                None => return,
+                Some(loader) => loader,
+            };
+
+            match loader.sync_next(&dialog, download_progress).await {
+                Ok(_) => {}
+                Err(e) => {
+                    dialog.send_dialog(
+                        format!("Could not do external filter sync, switching to P2P: {}", e))
+                        .await;
+                    let mut policy = sync_policy.write().await;
+                    *policy = FilterSyncPolicy::P2P;
+                }
+            }
+        });
     }
 
     /// Run the node continuously. Typically run on a separate thread than the underlying application.
@@ -211,6 +306,7 @@ impl<H: HeaderStore + 'static, P: PeerStore + 'static, B: BlocksStore + 'static 
             self.dispatch().await?;
             self.request_next_block_batch().await;
             self.broadcast_transactions().await;
+            self.maybe_download_filters().await;
 
             let peer = tokio::time::timeout(
                 Duration::from_secs(LOOP_TIMEOUT), peer_recv.recv(),
@@ -528,12 +624,17 @@ impl<H: HeaderStore + 'static, P: PeerStore + 'static, B: BlocksStore + 'static 
         // Once filter sync is initiated, it must be completed before syncing
         // blocks again.
         let blocks_synced = chain.blocks_synced().await;
+        let filter_p2p = {
+            if let Ok(policy) = self.filter_sync_policy.try_read() {
+                matches!(*policy, FilterSyncPolicy::P2P)
+            } else {
+                false
+            }
+        };
         let filter_sync = (blocks_synced || can_sync_filters) &&
             !chain.filters_synced().await &&
-            matches!(*self.filter_sync_policy.read().await, FilterSyncPolicy::Continue);
-        if blocks_synced {
-            chain.can_sync_filters = true;
-        }
+            filter_p2p;
+        chain.can_sync_filters = filter_sync;
 
         if self.peer_map.lock().await.reset_peers(filter_sync).await {
             _ = self.dispatch().await;
@@ -557,7 +658,6 @@ impl<H: HeaderStore + 'static, P: PeerStore + 'static, B: BlocksStore + 'static 
         }
 
         self.peer_map.lock().await.request_next_download_batch().await;
-
     }
 
     // Broadcast transactions according to the configured policy
@@ -702,7 +802,7 @@ impl<H: HeaderStore + 'static, P: PeerStore + 'static, B: BlocksStore + 'static 
                 locators: chain.locators().await,
                 stop_hash: None,
             };
-            return Some(MainThreadMessage::GetHeaders(headers))
+            return Some(MainThreadMessage::GetHeaders(headers));
         }
 
         if chain.can_sync_filters && !chain.is_cf_headers_synced() {
@@ -865,11 +965,17 @@ impl<H: HeaderStore + 'static, P: PeerStore + 'static, B: BlocksStore + 'static 
             .filters_tip()
             .await;
 
+        let filters_count = filters_tip.map(|t| t.height).unwrap_or(0);
+        let filters_progress = match self.filter_download_progress.lock().await.clone() {
+            Some(p) => p,
+            None => filters_count as f32 / cf_filter_headers as f32
+        };
+
         Ok(BlockchainInfo {
             chain: "main".to_string(),
             blocks: if blocks_tip > headers { 0 } else { blocks_tip },
             headers,
-            filters: filters_tip.map(|t| t.height).unwrap_or(0),
+            filters: filters_count,
             filter_headers: cf_filter_headers,
             chain_work,
             checkpoint: self.checkpoint,
@@ -878,6 +984,7 @@ impl<H: HeaderStore + 'static, P: PeerStore + 'static, B: BlocksStore + 'static 
             median_time: 0,
             block_queue: self.queued_blocks.lock().await.clone(),
             pruned: true,
+            filters_progress
         })
     }
 
@@ -983,7 +1090,13 @@ impl<H: HeaderStore + 'static, P: PeerStore + 'static, B: BlocksStore + 'static 
     // Continue the filter syncing process by explicit command
     async fn start_filter_download(&self) -> Option<MainThreadMessage> {
         let mut download_policy = self.filter_sync_policy.write().await;
-        *download_policy = FilterSyncPolicy::Continue;
+        if self.external_filter_endpoint.is_some() {
+            self.dialog.send_dialog("Starting external filter download as requested").await;
+            *download_policy = FilterSyncPolicy::External;
+        } else {
+            self.dialog.send_dialog("Starting p2p filter download as requested").await;
+            *download_policy = FilterSyncPolicy::P2P;
+        }
         drop(download_policy);
         None
     }
@@ -1012,5 +1125,152 @@ impl core::fmt::Display for NodeState {
                 write!(f, "Filter headers synced.")
             }
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExternalFilterLoader {
+    #[allow(dead_code)]
+    progress: Option<DownloadProgress>,
+    status: FilterLoadStatus,
+    endpoint_url: String,
+    filter_headers_path: PathBuf,
+    filters_path: PathBuf,
+    header_checkpoint: HeaderCheckpoint,
+    prune_point: HeaderCheckpoint,
+    attempts: usize,
+    last_attempt: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub enum FilterLoadStatus {
+    Idle,
+    FilterHeaders,
+    Filters,
+    Loaded,
+}
+
+#[derive(Debug, Clone)]
+pub struct DownloadProgress {
+    pub downloaded: u64,
+    pub total: u64,
+
+}
+
+impl ExternalFilterLoader {
+
+    async fn sync_next(&mut self, dialog: &Arc<Dialog>, p: Arc<Mutex<Option<f32>>>) -> anyhow::Result<()> {
+        if self.last_attempt.elapsed() <= Duration::from_secs(1) {
+            return Ok(());
+        }
+        match self.try_sync_next(dialog, p).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if self.attempts > 6 {
+                    return Err(e);
+                }
+                self.last_attempt = Instant::now();
+                self.attempts += 1;
+                dialog.send_dialog(format!(
+                    "{} (attempt {})",
+                    e.to_string(), self.attempts)).await;
+                Ok(())
+            }
+        }
+    }
+    async fn try_sync_next(
+        &mut self,
+        dialog: &Arc<Dialog>,
+        p: Arc<Mutex<Option<f32>>>
+    ) -> anyhow::Result<()> {
+        if matches!(self.status, FilterLoadStatus::Loaded) {
+            return Ok(());
+        }
+
+        let endpoint_url = self.endpoint_url.trim_end_matches("/");
+        match self.status {
+            FilterLoadStatus::Idle => self.status = FilterLoadStatus::FilterHeaders,
+            FilterLoadStatus::FilterHeaders => {
+                let headers_endpoint = format!("{}/cf_headers_{}-{}.bin", endpoint_url,
+                                               self.header_checkpoint.height,
+                                               self.prune_point.height
+                );
+                if self.filter_headers_path.exists() {
+                    let backup = self.filter_headers_path.with_extension("bak");
+                    let _ = tokio::fs::rename(&self.filter_headers_path, &backup).await;
+                }
+                dialog.send_dialog(format!("Loading filter headers from {}", headers_endpoint)).await;
+                self.download_file(&headers_endpoint, &self.filter_headers_path, None).await?;
+                self.status = FilterLoadStatus::Filters;
+            }
+            FilterLoadStatus::Filters => {
+                if self.filters_path.exists() {
+                    let backup = self.filters_path.with_extension("bak");
+                    let _ = tokio::fs::rename(&self.filters_path, &backup).await;
+                }
+                let filters_endpoint = format!("{}/filters_{}-{}.db", endpoint_url,
+                                               self.header_checkpoint.height,
+                                               self.prune_point.height
+                );
+                dialog.send_dialog(format!("Loading filters from {}", filters_endpoint)).await;
+
+                let (tx, mut rx) =
+                    mpsc::channel::<DownloadProgress>(20);
+                tokio::spawn(async move {
+                   while let Some(update) = rx.recv().await {
+                       p.lock().await.replace(update.downloaded as f32 / update.total as f32);
+                   }
+                });
+                self.download_file(&filters_endpoint, &self.filters_path, Some(tx)).await?;
+                self.status = FilterLoadStatus::Loaded;
+            }
+            FilterLoadStatus::Loaded => {
+                dialog.send_dialog("Filters loaded").await;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn download_file(
+        &self,
+        url: &str,
+        file_path: &PathBuf,
+        mut progress: Option<mpsc::Sender<DownloadProgress>>,
+    ) -> anyhow::Result<()> {
+        let client = reqwest::Client::new();
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| anyhow!("Could not load filters from external source: {}", e))?;
+
+        if !response.status().is_success() {
+            return Err(anyhow::anyhow!("HTTP request failed with status: {}", response.status()));
+        }
+
+        let total = response
+            .content_length()
+            .context("Could not get content length")?;
+
+        let mut file = tokio::fs::File::create(file_path)
+            .await
+            .map_err(|e| anyhow!("Could not create path to store filters: {}", e))?;
+
+        let mut downloaded = 0;
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("Failed to read chunk")?;
+            file.write_all(&chunk)
+                .await
+                .context("Failed to write chunk to file")?;
+            downloaded += chunk.len() as u64;
+
+            if let Some(progress) = progress.as_mut() {
+                _ = progress.send(DownloadProgress { downloaded, total }).await;
+            }
+        }
+        file.flush().await.context("Failed to flush file")?;
+        Ok(())
     }
 }

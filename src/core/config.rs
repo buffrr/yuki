@@ -27,6 +27,7 @@ pub(crate) struct NodeConfig {
     pub response_timeout: Duration,
     pub max_connection_time: Duration,
     pub filter_sync_policy: FilterSyncPolicy,
+    pub external_filter_endpoint: Option<String>,
     pub log_level: LogLevel,
     pub cf_headers_path: PathBuf,
 }
@@ -46,6 +47,7 @@ impl Default for NodeConfig {
             response_timeout: Duration::from_secs(TIMEOUT_SECS),
             max_connection_time: Duration::from_secs(TWO_HOUR),
             filter_sync_policy: Default::default(),
+            external_filter_endpoint: None,
             log_level: Default::default(),
             cf_headers_path: Default::default(),
         }

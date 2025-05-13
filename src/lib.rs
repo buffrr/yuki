@@ -246,6 +246,9 @@ pub struct BlockchainInfo {
     #[serde(rename = "blockqueue")]
     pub block_queue: QueueBlocksStatus,
     pub checkpoint: HeaderCheckpoint,
+
+    #[serde(rename = "filtersprogress")]
+    pub filters_progress: f32,
 }
 
 impl TxBroadcast {
@@ -466,4 +469,4 @@ macro_rules! log {
 
 pub(crate) use log;
 use serde::{Deserialize, Serialize};
-use crate::core::node::QueueBlocksStatus;
+use crate::core::node::{QueueBlocksStatus};
