@@ -39,6 +39,11 @@ pub struct Args {
     /// in the format <block-hash>:<block-height>
     #[arg(long, env = "YUKI_PRUNE_POINT")]
     prune_point: Option<String>,
+
+    /// Load filters from an external endpoint instead of the P2P network
+    /// (useful if it's hard/or too slow to find peers serving compact filters)
+    #[arg(long, env= "YUKI_EXTERNAL_FILTERS_ENDPOINT")]
+    filters_endpoint: Option<String>,
 }
 
 pub async fn run(args: Vec<String>, shutdown: broadcast::Sender<()>) -> anyhow::Result<()> {
@@ -58,14 +63,19 @@ pub async fn run(args: Vec<String>, shutdown: broadcast::Sender<()>) -> anyhow::
     let prune_point = parse_checkpoint(args.prune_point.as_deref(), network)?;
 
     // Build the node
-    let builder = NodeBuilder::new(network);
-    let (node, client) = builder
+    let mut builder = NodeBuilder::new(network)
         .anchor_checkpoint(checkpoint)
         .prune_point(prune_point)
         .peer_db_size(PeerStoreSizeConfig::Limit(256))
         .required_peers(8)
         .data_dir(data_dir)
-        .halt_filter_download()
+        .halt_filter_download();
+
+    if let Some(external) = args.filters_endpoint {
+        builder = builder.external_filter_endpoint(&external);
+    }
+
+    let (node, client) = builder
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build node: {}", e))?;
 

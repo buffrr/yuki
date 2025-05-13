@@ -193,6 +193,11 @@ impl NodeBuilder {
         self
     }
 
+    pub fn external_filter_endpoint(mut self, endpoint: &str) -> Self {
+        self.config.external_filter_endpoint = Some(endpoint.to_string());
+        self
+    }
+
     /// Consume the node builder and receive a [`Node`] and [`Client`].
     ///
     /// # Errors

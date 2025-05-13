@@ -69,9 +69,12 @@ impl LastBlockMonitor {
 pub enum FilterSyncPolicy {
     /// The node will wait for an explicit command to start downloading and checking filters
     Halt,
-    /// Filters are downloaded immediately after CBF headers are synced.
+    /// Filters are downloaded from P2P network after block sync.
     #[default]
-    Continue,
+    P2P,
+    /// Filters are downloaded from an external endpoint URL
+    External
+
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]

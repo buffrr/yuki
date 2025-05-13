@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
 };
 use std::path::PathBuf;
+use anyhow::anyhow;
 use tokio::sync::RwLock;
 use bitcoin::{block::Header, p2p::message_filter::{CFHeaders, GetCFHeaders}, Block, BlockHash, CompactTarget, Network, ScriptBuf, Work};
 use tokio::sync::Mutex;
@@ -167,6 +168,7 @@ pub(crate) struct Chain<H: HeaderStore, B: BlocksStore + 'static, F: FiltersStor
     pub(crate) prune_height: Option<u32>,
     cfheader_chain_path: PathBuf,
     pub can_sync_filters: bool,
+    cfheader_quorum_required: usize,
 }
 
 #[allow(dead_code)]
@@ -214,7 +216,30 @@ impl<H: HeaderStore, B: BlocksStore, F: FiltersStore> Chain<H, B, F> {
             downloading: Arc::new(RwLock::new(false)),
             prune_height: prune_point.map(|p| p.height),
             can_sync_filters: false,
+            cfheader_quorum_required: quorum_required
         }
+    }
+
+    pub async fn reload_filters(&mut self) -> anyhow::Result<()> {
+        let mut err = None;
+        self.cf_header_chain = match CFHeaderChain::load(self.cfheader_chain_path.clone()) {
+            Ok(cf_header_chain) => {
+                cf_header_chain
+            },
+            Err(e) => {
+                err = Some(e);
+                CFHeaderChain::new(
+                    self.persister.lock().await.checkpoint.clone(),
+                    self.cfheader_quorum_required
+                )
+            }
+        };
+        if let Some(err) = err {
+            return Err(anyhow!("Could not reload filter headers: {}", err));
+        }
+        self.persister.lock().await.filters_db.reload().await.map_err(|e|
+            anyhow!("Could not reload filters: {}", e))?;
+        Ok(())
     }
 
     pub(crate) async fn join_block_download(
