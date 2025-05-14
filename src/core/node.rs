@@ -971,7 +971,13 @@ impl<H: HeaderStore + 'static, P: PeerStore + 'static, B: BlocksStore + 'static 
         };
 
         Ok(BlockchainInfo {
-            chain: "main".to_string(),
+            chain: match chain.network {
+                Network::Bitcoin => "main",
+                Network::Testnet |  Network::Testnet4  => "test",
+                Network::Signet => "signet",
+                Network::Regtest => "regtest",
+                _ => "unknown"
+            }.to_string(),
             blocks: if blocks_tip > headers { 0 } else { blocks_tip },
             headers,
             filters: filters_count,
