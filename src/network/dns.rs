@@ -33,6 +33,11 @@ const MAINNET_SEEDS: &[&str; 6] = &[
     "seed.bitcoin.wiz.biz",
 ];
 
+const TESTNET4_SEEDS: &[&str; 2] = &[
+    "seed.testnet4.bitcoin.sprovoost.nl",
+    "seed.testnet4.wiz.biz",
+];
+
 pub(crate) const DNS_RESOLVER_PORT: u16 = 53;
 const LOCAL_HOST: &str = "0.0.0.0:0";
 
@@ -87,7 +92,7 @@ impl Dns<'_> {
             Network::Testnet => TESTNET_SEEDS.to_vec(),
             Network::Signet => SIGNET_SEEDS.to_vec(),
             Network::Regtest => Vec::with_capacity(0),
-            Network::Testnet4 => Vec::with_capacity(0),
+            Network::Testnet4 => TESTNET4_SEEDS.to_vec(),
             _ => unreachable!(),
         };
         Self {
