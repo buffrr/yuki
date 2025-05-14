@@ -367,7 +367,6 @@ impl<H: HeaderStore + 'static, P: PeerStore + 'static, B: BlocksStore + 'static 
                             continue;
                         }
                         PeerMessage::Block(block) => {
-                            crate::log!(self.dialog, format!("{} sent block {}", peer_thread.nonce, block.block_hash()));
                             match self.handle_block(peer_thread.nonce, block).await {
                                 Some(response) => {
                                     self.send_message(peer_thread.nonce, response).await;

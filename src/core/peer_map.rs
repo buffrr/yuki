@@ -35,7 +35,7 @@ use super::{
 };
 
 const MAX_TRIES: usize = 50;
-const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 32;
+const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
 
 // We may be a little bit more aggressive compared to Bitcoin core here
 // Since we apply this policy to all our peers but the timeout values are more generous
@@ -172,10 +172,12 @@ impl<P: PeerStore> PeerMap<P> {
         for peer_id in &dropped_peers {
             if let Some(peer) = self.map.remove(peer_id) {
                 if !peer.handle.is_finished() {
-                    self.adaptive_stall_timeout = std::cmp::min(
-                        self.adaptive_stall_timeout.mul_f32(2.0),
-                        BLOCK_STALLING_TIMEOUT_MAX,
-                    );
+                    if peer.stalled(adaptive_stall_timeout) {
+                        self.adaptive_stall_timeout = std::cmp::min(
+                            self.adaptive_stall_timeout.mul_f32(2.0),
+                            BLOCK_STALLING_TIMEOUT_MAX,
+                        );
+                    }
 
                     _ = peer.ptx.send(MainThreadMessage::Disconnect).await;
                     peer.handle.abort();
@@ -517,10 +519,16 @@ impl<P: PeerStore> PeerMap<P> {
                 let position = match peer.pending_downloads
                     .iter().position(|d|  matches!(d.kind, AdvanceKind::Blocks) &&
                     d.hash.eq(&block_hash)) {
-                    None => return None,
+                    None => {
+                        crate::log!(self.dialog, format!("Received unrequested block {}",block.block_hash()));
+                        return None;
+                    },
                     Some(pos) => pos
                 };
+
                 let req = peer.pending_downloads.remove(position);
+                crate::log!(self.dialog, format!("Received block {} {}", req.height, block.block_hash()));
+
                 let res = DownloadKind::Block(IndexedBlock {
                     height: req.height,
                     block,
