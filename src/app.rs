@@ -1,5 +1,5 @@
 use bitcoin::{BlockHash, Network};
-use clap::{Parser};
+use clap::{Parser, ValueEnum};
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -13,6 +13,7 @@ use crate::{Client, HeaderCheckpoint, Log, NodeBuilder, PeerStoreSizeConfig, Req
 
 const DEFAULT_RPC_PORT: u16 = 8225;
 
+
 #[derive(Parser, Debug, Serialize, Deserialize)]
 #[command(args_override_self = true, author, version, about, long_about = None)]
 pub struct Args {
@@ -20,8 +21,8 @@ pub struct Args {
     data_dir: Option<PathBuf>,
 
     /// Network to use
-    #[arg(long, env = "YUKI_CHAIN", default_value = "bitcoin")]
-    chain: Network,
+    #[arg(long, env = "YUKI_CHAIN", default_value = "mainnet")]
+    chain: ExtendedNetwork,
 
     /// Bind to given address to listen for JSON-RPC connections.
     #[arg(long, default_values = ["127.0.0.1"], env = "YUKI_RPC_BIND")]
@@ -53,7 +54,7 @@ pub async fn run(args: Vec<String>, shutdown: broadcast::Sender<()>) -> anyhow::
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
     // Map CLI network to Kyoto network
-    let network: Network = args.chain.into();
+    let network = args.chain.network();
 
     // Use provided data directory or default
     let data_dir = args.data_dir.unwrap_or_else(|| PathBuf::from("./data"));
@@ -232,4 +233,27 @@ async fn start_rpc_listeners(
     }
 
     Ok(handles)
+}
+
+// Just a more "standard" network names
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExtendedNetwork {
+    Mainnet,
+    Testnet,
+    Testnet4,
+    Signet,
+    Regtest,
+}
+
+impl ExtendedNetwork {
+    fn network(&self) -> Network {
+        match self {
+            ExtendedNetwork::Mainnet => Network::Bitcoin,
+            ExtendedNetwork::Testnet => Network::Testnet,
+            ExtendedNetwork::Testnet4 => Network::Testnet4,
+            ExtendedNetwork::Signet => Network::Signet,
+            ExtendedNetwork::Regtest => Network::Regtest
+        }
+    }
 }

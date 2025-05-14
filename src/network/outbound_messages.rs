@@ -15,7 +15,6 @@ use crate::{prelude::default_port_from_network};
 
 use super::{
     error::PeerError, traits::MessageGenerator, YUKI_VERSION, PROTOCOL_VERSION,
-    RUST_BITCOIN_VERSION,
 };
 
 pub(crate) struct V1OutboundMessage {

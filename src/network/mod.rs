@@ -19,7 +19,6 @@ pub(crate) mod traits;
 
 pub const PROTOCOL_VERSION: u32 = 70016;
 pub const YUKI_VERSION: &str = "0.0.1";
-pub const RUST_BITCOIN_VERSION: &str = "0.32.4";
 
 pub(crate) struct V1Header {
     magic: Magic,
