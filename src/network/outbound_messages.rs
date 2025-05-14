@@ -14,8 +14,7 @@ use bitcoin::{consensus::serialize, hashes::Hash, p2p::{
 use crate::{prelude::default_port_from_network};
 
 use super::{
-    error::PeerError, traits::MessageGenerator, KYOTO_VERSION, PROTOCOL_VERSION,
-    RUST_BITCOIN_VERSION,
+    error::PeerError, traits::MessageGenerator, YUKI_VERSION, PROTOCOL_VERSION,
 };
 
 pub(crate) struct V1OutboundMessage {
@@ -47,7 +46,7 @@ fn make_version(port: Option<u16>, network: &Network) -> VersionMessage {
         sender: from_and_recv,
         nonce: 1,
         user_agent: format!(
-            "Kyoto Light Client / {KYOTO_VERSION} / rust-bitcoin {RUST_BITCOIN_VERSION}"
+            "Yuki / {YUKI_VERSION}"
         ),
         start_height: 0,
         relay: false,

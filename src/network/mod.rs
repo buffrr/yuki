@@ -18,8 +18,7 @@ pub(crate) mod tor;
 pub(crate) mod traits;
 
 pub const PROTOCOL_VERSION: u32 = 70016;
-pub const KYOTO_VERSION: &str = "0.8.0";
-pub const RUST_BITCOIN_VERSION: &str = "0.32.4";
+pub const YUKI_VERSION: &str = "0.0.1";
 
 pub(crate) struct V1Header {
     magic: Magic,
