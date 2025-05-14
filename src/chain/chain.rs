@@ -158,7 +158,7 @@ pub(crate) struct Chain<H: HeaderStore, B: BlocksStore + 'static, F: FiltersStor
     header_chain: HeaderChain,
     cf_header_chain: CFHeaderChain,
     checkpoints: HeaderCheckpoints,
-    network: Network,
+    pub network: Network,
     db: Arc<Mutex<H>>,
     pub(crate) persister: Arc<Mutex<DownloadPersister<B, F>>>,
     heights: Arc<Mutex<HeightMonitor>>,
