@@ -64,6 +64,11 @@ pub trait FiltersStore: Debug + Send + Sync {
         range: impl RangeBounds<u32> + Send + Sync + 'a + 'static,
     ) -> FutureResult<'a, BTreeMap<u32, Filter>, Self::Error>;
 
+    fn get_block_hash(
+        &mut self,
+        height: u32,
+    ) -> FutureResult<Option<BlockHash>, Self::Error>;
+
     /// Persist the current filters tip checkpoint.
     fn set_tip(
         &mut self,
@@ -157,6 +162,28 @@ impl SqliteFilterDb {
                 Ok(Some(HeaderCheckpoint { height, hash }))
             } else {
                 return Ok(None)
+            }
+        })
+            .await
+            .expect("spawn_blocking failed")
+    }
+
+    async fn get_block_hash(&mut self, height: u32) -> Result<Option<BlockHash>, SqlFiltersStoreError> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<BlockHash>, SqlFiltersStoreError> {
+            let write_lock = conn.blocking_lock();
+            let stmt = "SELECT block_hash FROM filters WHERE height = ?1";
+            let hash_str: Option<String> = write_lock
+                .query_row(stmt, params![height], |row| row.get(0))
+                .optional()?;
+
+            match hash_str {
+                Some(hash) => {
+                    let block_hash = BlockHash::from_str(&hash)
+                        .map_err(|_| SqlFiltersStoreError::StringConversion)?;
+                    Ok(Some(block_hash))
+                }
+                None => Ok(None),
             }
         })
             .await
@@ -305,6 +332,13 @@ impl FiltersStore for SqliteFilterDb {
 
     fn reload(&self) -> FutureResult<(), SqlInitializationError> {
         Box::pin(self.reload())
+    }
+
+    fn get_block_hash(
+        &mut self,
+        height: u32,
+    ) -> FutureResult<Option<BlockHash>, Self::Error> {
+        Box::pin(self.get_block_hash(height))
     }
 
     fn insert_filters(

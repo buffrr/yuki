@@ -57,7 +57,7 @@ pub trait Rpc {
     async fn get_block_header(&self, block_hash: BlockHash) -> Result<Header, ErrorObjectOwned>;
 
     #[method(name = "sendrawtransaction")]
-    async fn send_raw_transaction(&self, hex_string: String, max_fee_rate: Option<String>) -> Result<Txid, ErrorObjectOwned>;
+    async fn send_raw_transaction(&self, hex_string: String, max_fee_rate: Option<u32>, max_burn: Option<u32>) -> Result<Txid, ErrorObjectOwned>;
 
     #[method(name = "getmempoolentry")]
     async fn get_mempool_entry(&self, txid: Txid) -> Result<Option<MempoolEntryResult>, ErrorObjectOwned>;
@@ -185,7 +185,7 @@ impl RpcServer for RpcServerImpl {
             .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<String>))
     }
 
-    async fn send_raw_transaction(&self, hex_string: String, _max_fee_rate: Option<String>) -> Result<Txid, ErrorObjectOwned> {
+    async fn send_raw_transaction(&self, hex_string: String, _max_fee_rate: Option<u32>, _max_burn: Option<u32>) -> Result<Txid, ErrorObjectOwned> {
         let tx: Transaction =  bitcoin::consensus::encode::deserialize_hex(&hex_string)
             .map_err(|_| ErrorObjectOwned::owned(-1, "Invalid transaction", None::<String>))?;
 
@@ -218,7 +218,9 @@ impl RpcServer for RpcServerImpl {
         let info = self.requester.get_blockchain_info().await
             .map_err(|e| ErrorObjectOwned::owned(-1, e.to_string(), None::<String>))?;
 
-        if info.headers <= info.checkpoint.height || info.prune_height.is_some_and(|h| info.headers < h) {
+        if !info.headers_synced ||
+            info.headers <= info.checkpoint.height ||
+            info.prune_height.is_some_and(|h| info.headers <= h) {
             return Err(ErrorObjectOwned::owned(-1, "Headers are still syncing", None::<String>));
         }
         Ok(info.headers)

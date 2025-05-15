@@ -77,7 +77,7 @@ pub async fn run(args: Vec<String>, shutdown: broadcast::Sender<()>) -> anyhow::
     }
 
     let (node, client) = builder
-        .build()
+        .build().await
         .map_err(|e| anyhow::anyhow!("Failed to build node: {}", e))?;
 
     // Create a channel to signal shutdown
