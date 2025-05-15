@@ -249,6 +249,9 @@ pub struct BlockchainInfo {
 
     #[serde(rename = "filtersprogress")]
     pub filters_progress: f32,
+
+    #[serde(rename = "headerssynced")]
+    pub headers_synced: bool,
 }
 
 impl TxBroadcast {

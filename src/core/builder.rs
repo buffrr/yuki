@@ -12,6 +12,7 @@ use crate::{
     db::traits::{HeaderStore, PeerStore},
 };
 use crate::{ConnectionType, LogLevel, PeerStoreSizeConfig, TrustedPeer};
+use crate::core::node::MempoolStore;
 use crate::db::sqlite::blocks::{BlocksStore, SqliteBlockDb};
 use crate::db::sqlite::filters::{FiltersStore, SqliteFilterDb};
 
@@ -204,13 +205,16 @@ impl NodeBuilder {
     ///
     /// Building a node and client will error if a database connection is denied or cannot be found.
     #[cfg(feature = "database")]
-    pub fn build(&mut self) -> Result<(NodeDefault, Client), SqlInitializationError> {
+    pub async fn build(&mut self) -> anyhow::Result<(NodeDefault, Client)> {
 
         let peer_store = SqlitePeerDb::new(self.network, self.config.data_path.clone())?;
         let header_store = SqliteHeaderDb::new(self.network, self.config.data_path.clone())?;
         let block_store = SqliteBlockDb::new(self.network, self.config.data_path.clone())?;
         let filter_store = SqliteFilterDb::new(self.network, self.config.data_path.clone())?;
         self.config.cf_headers_path = create_cf_headers_path(self.network, self.config.data_path.clone())?;
+
+        let mempool_path = create_mempool_store_path(self.network, self.config.data_path.clone())?;
+        let mempool_store = MempoolStore::load(mempool_path).await?;
 
         Ok(Node::new(
             self.network,
@@ -219,6 +223,7 @@ impl NodeBuilder {
             header_store,
             block_store,
             filter_store,
+            mempool_store
         ))
     }
 
@@ -229,6 +234,7 @@ impl NodeBuilder {
         header_store: H,
         block_store: B,
         filter_store: F,
+        mempool_store: MempoolStore,
     ) -> (Node<H, P, B, F>, Client) {
         Node::new(
             self.network,
@@ -237,6 +243,7 @@ impl NodeBuilder {
             header_store,
             block_store,
             filter_store,
+            mempool_store
         )
     }
 }
@@ -250,4 +257,14 @@ fn create_cf_headers_path(network: Network, path: Option<PathBuf>) -> Result<Pat
         std::fs::create_dir_all(&path)?;
     }
     Ok(path.join("cf_headers.bin"))
+}
+
+fn create_mempool_store_path(network: Network, path: Option<PathBuf>) -> Result<PathBuf, SqlInitializationError> {
+    let mut path = path.unwrap_or_else(|| PathBuf::from("."));
+    path.push("data");
+    path.push(network.to_string());
+    if !path.exists() {
+        std::fs::create_dir_all(&path)?;
+    }
+    Ok(path.join("mempool.json"))
 }

@@ -1,13 +1,14 @@
 use std::{ops::DerefMut, sync::Arc, time::Duration};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap};
 use futures_util::stream::StreamExt;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context};
 use bitcoin::{block::Header, p2p::{
     message_filter::{CFHeaders, CFilter},
     message_network::VersionMessage,
 }, Block, BlockHash, Network, ScriptBuf, Transaction, Txid};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tokio::sync::{mpsc::Receiver, Mutex, RwLock};
 use tokio::{
     sync::mpsc::{self},
@@ -45,6 +46,10 @@ use super::{
 pub(crate) const WTXID_VERSION: u32 = 70016;
 const LOOP_TIMEOUT: u64 = 1;
 
+const CHECK_PEERS_MEMPOOL_INTERVAL: Duration = Duration::from_secs(28);
+const LAST_SEEN_IN_MEMPOOL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+
 type PeerRequirement = usize;
 
 /// The state of the node with respect to connected peers.
@@ -58,6 +63,7 @@ pub enum NodeState {
     FilterHeadersSynced,
 }
 
+
 /// A compact block filter node. Nodes download Bitcoin block headers, block filters, and blocks to send relevant events to a client.
 #[derive(Debug, Clone)]
 pub struct Node<H: HeaderStore, P: PeerStore, B: BlocksStore + 'static, F: FiltersStore + 'static> {
@@ -66,7 +72,7 @@ pub struct Node<H: HeaderStore, P: PeerStore, B: BlocksStore + 'static, F: Filte
     peer_map: Arc<Mutex<PeerMap<P>>>,
     tx_broadcaster: Arc<Mutex<Broadcaster>>,
     // A partial mempool of transactions we have broadcasted
-    mempool: Arc<Mutex<Vec<MempoolTransaction>>>,
+    mempool: Arc<Mutex<MempoolStore>>,
     required_peers: PeerRequirement,
     dialog: Arc<Dialog>,
     client_recv: Arc<Mutex<Receiver<ClientMessage>>>,
@@ -80,19 +86,30 @@ pub struct Node<H: HeaderStore, P: PeerStore, B: BlocksStore + 'static, F: Filte
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MempoolStore {
+    txs: Vec<MempoolTransaction>,
+    file_path: PathBuf,
+}
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 // status for on demand blocks
 pub struct QueueBlocksStatus {
     pending: u32,
     completed: u32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MempoolTransaction {
     tx: Transaction,
     txid: Txid,
+    #[serde(serialize_with = "serialize_instant", deserialize_with = "deserialize_instant")]
     last_seen: Option<Instant>,
-    broadcast: Instant,
-    last_check: Instant,
+    #[serde(serialize_with = "serialize_instant", deserialize_with = "deserialize_instant")]
+    broadcast: Option<Instant>,
+    #[serde(serialize_with = "serialize_instant", deserialize_with = "deserialize_instant")]
+    last_check: Option<Instant>,
+    time: u64,
 }
 
 impl<H: HeaderStore + 'static, P: PeerStore + 'static, B: BlocksStore + 'static + Send, F: FiltersStore + 'static> Node<H, P, B, F> {
@@ -103,6 +120,7 @@ impl<H: HeaderStore + 'static, P: PeerStore + 'static, B: BlocksStore + 'static 
         header_store: H,
         block_store: B,
         filter_store: F,
+        mempool_store: MempoolStore,
     ) -> (Self, Client) {
         let NodeConfig {
             required_peers,
@@ -189,7 +207,7 @@ impl<H: HeaderStore + 'static, P: PeerStore + 'static, B: BlocksStore + 'static 
                 chain,
                 peer_map,
                 tx_broadcaster,
-                mempool: Arc::new(Default::default()),
+                mempool: Arc::new(Mutex::new(mempool_store)),
                 required_peers: required_peers.into(),
                 dialog,
                 client_recv: Arc::new(Mutex::new(crx)),
@@ -359,10 +377,10 @@ impl<H: HeaderStore + 'static, P: PeerStore + 'static, B: BlocksStore + 'static 
                             let txid = tx.compute_txid();
                             crate::log!(self.dialog, format!("{} sent tx {}", peer_thread.nonce, txid));
                             // Refresh the last seen to keep them in our mempool
-                            let mut mem = self.mempool.lock().await;
-                            if let Some(mem_tx) = mem.iter_mut()
-                                .find(|m| m.txid == txid) {
-                                mem_tx.last_seen = Some(Instant::now());
+                            if let Err(e) = self.mempool.lock().await.refresh(txid).await {
+                                self.dialog
+                                    .send_dialog(format!("Could not refresh mempool tx {}: {}", txid, e))
+                                    .await;
                             }
                             continue;
                         }
@@ -386,7 +404,6 @@ impl<H: HeaderStore + 'static, P: PeerStore + 'static, B: BlocksStore + 'static 
                             }
                         }
                         PeerMessage::Reject(payload) => {
-                            self.mempool.lock().await.retain(|tx| tx.tx.compute_txid() != payload.txid);
                             self.dialog
                                 .send_warning(Warning::TransactionRejected { payload });
                         }
@@ -419,7 +436,28 @@ impl<H: HeaderStore + 'static, P: PeerStore + 'static, B: BlocksStore + 'static 
                         cancellation_token.cancel();
                         return Ok(());
                     }
-                    ClientMessage::Broadcast(transaction) => self.tx_broadcaster.lock().await.add(transaction),
+                    ClientMessage::Broadcast(broadcast) => {
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .expect("Time went backwards");
+                        // Accept tx in our mini mempool, and then we observe
+                        // if other peers retain it or drop it.
+                        let txid = broadcast.tx.compute_txid();
+                        if let Err(e) = self.mempool.lock().await.insert(MempoolTransaction {
+                            tx: broadcast.tx.clone(),
+                            txid,
+                            last_seen: None,
+                            broadcast: None,
+                            last_check: None,
+                            time: now.as_secs(),
+                        }).await {
+                            self.dialog.send_dialog(
+                                format!("Could not insert tx {} to mempool: {}", txid, e))
+                                .await;
+                        } else {
+                            self.tx_broadcaster.lock().await.add(broadcast)
+                        }
+                    },
                     ClientMessage::AddScript(script) => self.add_script(script).await,
                     ClientMessage::Rescan => {
                         if let Some(response) = self.rescan().await {
@@ -504,21 +542,8 @@ impl<H: HeaderStore + 'static, P: PeerStore + 'static, B: BlocksStore + 'static 
                     }
                     ClientMessage::NoOp => (),
                     ClientMessage::GetMempoolEntry(request) => {
-                        match self.mempool.lock().await.iter()
-                            .find(|tx| tx.tx.compute_txid() == request.txid) {
-                            None => {
-                                _ = request.oneshot.send(None);
-                            }
-                            Some(entry) => {
-                                if entry.last_seen.is_none() {
-                                    _ = request.oneshot.send(None);
-                                    continue;
-                                }
-
-                                let result = MempoolEntryResult::default();
-                                _ = request.oneshot.send(Some(result));
-                            }
-                        }
+                        _ = request.oneshot
+                            .send(self.mempool.lock().await.get_mempool_entry(request.txid));
                     }
                     ClientMessage::GetBlockFilterByHeight(bfr) => {
                         let result = self.chain.lock().await
@@ -667,35 +692,25 @@ impl<H: HeaderStore + 'static, P: PeerStore + 'static, B: BlocksStore + 'static 
             // Observe the transactions we have broadcasted by asking other peers
             // to see if they're still being held in their mempool.
             // This is to lossely detect if they have been replaced/or mined.
-            // (We don't have a good view of the mempool in general)
+            // (We don't have a good view of the mempool otherwise)
             {
-                const CHECK_PEERS_MEMPOOL_INTERVAL: Duration = Duration::from_secs(28);
-                let mempool_txs: Vec<_> = {
-                    let mut mempool = self.mempool
-                        .lock().await;
-                    mempool.iter_mut()
-                        .filter(|m| m.last_check.elapsed() > CHECK_PEERS_MEMPOOL_INTERVAL)
-                        .map(|m| {
-                            m.last_check = Instant::now();
-                            m.txid
-                        }).collect()
-                };
+                let mempool_txs: Vec<_> = self.mempool
+                    .lock().await.get_txids_to_check();
                 if !mempool_txs.is_empty() {
-                    // Ask peers for the transactions that were broadcasted to see if they're still in mempool.
+                    // Ask peers for the transactions that were broadcasted to
+                    // see if they're still in mempool.
                     _ = peer_map.broadcast(MainThreadMessage::GetTx(mempool_txs)).await;
                 }
                 // Clear all transactions that appear to be removed
-                const LAST_SEEN_IN_MEMPOOL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-                let mut mempool = self.mempool.lock().await;
-                mempool
-                    .retain(|m|
-                        m.last_seen.as_ref().unwrap_or(&m.broadcast).elapsed() < LAST_SEEN_IN_MEMPOOL_TIMEOUT
-                    );
+                if let Err(e) = self.mempool.lock().await.remove_stale().await {
+                    self.dialog
+                        .send_dialog(format!("Could not remove stale txs from mempool: {}", e))
+                        .await;
+                }
             }
 
             for transaction in broadcaster.queue() {
                 let txid = transaction.tx.compute_txid();
-                let tx = transaction.tx.clone();
                 let did_broadcast = match transaction.broadcast_policy {
                     TxBroadcastPolicy::AllPeers => {
                         crate::log!(
@@ -713,16 +728,29 @@ impl<H: HeaderStore + 'static, P: PeerStore + 'static, B: BlocksStore + 'static 
                             .await.is_some()
                     }
                 };
+
                 if did_broadcast {
-                    self.mempool.lock().await.push(MempoolTransaction {
-                        tx,
-                        txid,
-                        last_seen: None,
-                        broadcast: Instant::now(),
-                        last_check: Instant::now(),
-                    });
+                    match self.mempool.lock().await.mark_broadcasted(txid).await {
+                        Ok(true) => {},
+                        Ok(false) => {
+                            self.dialog.send_dialog(
+                                format!("Expected tx {} to be in our mempool", txid)
+                            ).await;
+                        }
+                        Err(e) => {
+                            self.dialog.send_dialog(
+                                format!("Could not remove tx {} from mempool: {}", txid, e)
+                            ).await
+                        }
+                    }
                     self.dialog.send_info(Log::TxSent(txid)).await;
                 } else {
+                    // Tx wasn't broadcast remove it from our mempool
+                    if let Err(e) = self.mempool.lock().await.remove(txid).await {
+                        self.dialog.send_dialog(
+                            format!("Could not remove tx {} from mempool: {}", txid, e)
+                        ).await
+                    }
                     self.dialog.send_warning(Warning::TransactionRejected {
                         payload: RejectPayload::from_txid(txid),
                     });
@@ -772,6 +800,7 @@ impl<H: HeaderStore + 'static, P: PeerStore + 'static, B: BlocksStore + 'static 
         }
 
         if !matches!(*state, NodeState::Behind) {
+            self.chain.lock().await.update_median_time().await;
             if last_block.stale() {
                 self.dialog.send_warning(Warning::PotentialStaleTip);
                 crate::log!(
@@ -986,10 +1015,11 @@ impl<H: HeaderStore + 'static, P: PeerStore + 'static, B: BlocksStore + 'static 
             checkpoint: self.checkpoint,
             prune_height: chain.prune_height,
             best_blockhash: Some(best_hash),
-            median_time: 0,
+            median_time: chain.median_time() as _,
             block_queue: self.queued_blocks.lock().await.clone(),
             pruned: true,
-            filters_progress
+            filters_progress,
+            headers_synced: chain.is_synced().await,
         })
     }
 
@@ -1278,4 +1308,129 @@ impl ExternalFilterLoader {
         file.flush().await.context("Failed to flush file")?;
         Ok(())
     }
+}
+
+impl MempoolStore {
+    pub async fn load(file_path: PathBuf) -> anyhow::Result<Self> {
+        let mut txs = match tokio::fs::read_to_string(&file_path).await {
+            Ok(data) => serde_json::from_str(&data)
+                .map_err(|e| anyhow!("Could not deserialize mempool from {}: {}", file_path.display(), e))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec![],
+            Err(e) => return Err(anyhow!("Could not read mempool file {}: {}", file_path.display(), e)),
+        };
+
+        // refresh all
+        txs.iter_mut().for_each(|tx: &mut MempoolTransaction| {
+           if tx.last_seen.is_some() {
+               tx.last_seen = Some(Instant::now());
+           }
+        });
+        Ok(Self { txs, file_path })
+    }
+
+    pub async fn insert(&mut self, tx: MempoolTransaction) -> anyhow::Result<()> {
+        self.txs.retain(|mtx| mtx.txid != tx.txid);
+        self.txs.push(tx);
+        self.save().await
+    }
+
+    pub fn get_mempool_entry(&mut self, txid: Txid) -> Option<MempoolEntryResult> {
+        let entry = self.txs.iter()
+            .find(|tx| tx.txid == txid)?;
+        Some(MempoolEntryResult {
+            time: entry.time,
+            ..MempoolEntryResult::default()
+        })
+    }
+
+    pub async fn remove(&mut self, txid: Txid) -> anyhow::Result<()> {
+        self.txs.retain(|mtx| mtx.txid != txid);
+        self.save().await
+    }
+
+    pub async fn mark_broadcasted(&mut self, txid: Txid) -> anyhow::Result<bool> {
+        let entry = match self.txs
+            .iter_mut().find(|m| m.txid == txid) {
+            None => return Ok(false),
+            Some(entry) => entry,
+        };
+
+        entry.broadcast = Some(Instant::now());
+        entry.last_check = Some(Instant::now());
+        self.save().await?;
+        Ok(true)
+    }
+
+    pub async fn refresh(&mut self, txid: Txid) -> anyhow::Result<()> {
+        if let Some(mem_tx) = self.txs.iter_mut()
+            .find(|m| m.txid == txid) {
+            mem_tx.last_seen = Some(Instant::now());
+        }
+        self.save().await
+    }
+
+    pub async fn remove_stale(&mut self) -> anyhow::Result<()> {
+        self.txs.retain(|m| {
+            match &m.broadcast {
+                None => true,
+                Some(broadcast) =>
+                    m.last_seen.as_ref()
+                        .unwrap_or(broadcast).elapsed() < LAST_SEEN_IN_MEMPOOL_TIMEOUT
+            }
+        });
+        self.save().await
+    }
+
+    pub async fn save(&self) -> anyhow::Result<()> {
+        let data = serde_json::to_string_pretty(&self.txs)
+            .expect("could not serialize mempool txs");
+        tokio::fs::write(&self.file_path, data).await
+            .map_err(|e| anyhow!("Could not store mempool to file: {}: {}",
+                self.file_path.display(), e))?;
+        Ok(())
+    }
+
+    pub fn get_txids_to_check(&mut self) -> Vec<Txid> {
+        self.txs.iter_mut()
+            .filter(|m|
+                m.last_check
+                    .is_some_and(|t| t.elapsed() > CHECK_PEERS_MEMPOOL_INTERVAL)
+            )
+            .map(|m| {
+                m.last_check = Some(Instant::now());
+                m.txid
+            }).collect()
+    }
+}
+
+fn serialize_instant<S>(instant: &Option<Instant>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let seconds = match instant {
+        Some(i) => {
+            let now_secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| serde::ser::Error::custom(format!("Time error: {}", e)))?
+                .as_secs();
+            Some(now_secs - i.elapsed().as_secs())
+        }
+        None => None,
+    };
+    seconds.serialize(serializer)
+}
+
+fn deserialize_instant<'de, D>(deserializer: D) -> Result<Option<Instant>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let seconds = Option::<u64>::deserialize(deserializer)?;
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| serde::de::Error::custom(format!("Time error: {}", e)))?
+        .as_secs();
+    Ok(seconds.map(|s| {
+        let elapsed_secs = now_secs.saturating_sub(s);
+        Instant::now() - Duration::from_secs(elapsed_secs)
+    }))
 }

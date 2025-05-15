@@ -52,6 +52,11 @@ pub trait BlocksStore : Debug + Send + Sync  {
         height: u32,
     ) -> FutureResult<'a, Option<Block>, Self::Error>;
 
+    fn get_block_hash(
+        &mut self,
+        height: u32,
+    ) -> FutureResult<Option<BlockHash>, Self::Error>;
+
     /// Load blocks within a given height range.
     /// Returns a map from height to (BlockHash, Block).
     fn load_blocks<'a>(
@@ -158,6 +163,27 @@ impl SqliteBlockDb {
             .expect("spawn_blocking failed")
     }
 
+    async fn get_block_hash(&mut self, height: u32) -> Result<Option<BlockHash>, SqlBlocksStoreError> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || -> Result<Option<BlockHash>, SqlBlocksStoreError> {
+            let write_lock = conn.blocking_lock();
+            let stmt = "SELECT block_hash FROM blocks WHERE height = ?1";
+            let hash_str: Option<String> = write_lock
+                .query_row(stmt, params![height], |row| row.get(0))
+                .optional()?;
+
+            match hash_str {
+                Some(hash) => {
+                    let block_hash = BlockHash::from_str(&hash)
+                        .map_err(|_| SqlBlocksStoreError::StringConversion)?;
+                    Ok(Some(block_hash))
+                }
+                None => Ok(None),
+            }
+        })
+            .await
+            .expect("spawn_blocking failed")
+    }
 
     async fn get_block_by_hash(
         &mut self,
@@ -272,6 +298,7 @@ impl BlocksStore for SqliteBlockDb {
         Box::pin(self.insert_blocks(blocks))
     }
 
+
     fn get_block_by_hash<'a>(
         &'a mut self,
         block_hash: &'a BlockHash,
@@ -284,6 +311,13 @@ impl BlocksStore for SqliteBlockDb {
         height: u32,
     ) -> FutureResult<Option<Block>, Self::Error> {
         Box::pin(self.get_block_by_height(height))
+    }
+
+    fn get_block_hash(
+        &mut self,
+        height: u32,
+    ) -> FutureResult<Option<BlockHash>, Self::Error> {
+        Box::pin(self.get_block_hash(height))
     }
 
     fn load_blocks<'a>(

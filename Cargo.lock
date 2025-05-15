@@ -5689,6 +5689,7 @@ dependencies = [
  "reqwest",
  "rusqlite",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",

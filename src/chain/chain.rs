@@ -4,6 +4,7 @@ use std::{
     ops::Range,
     sync::Arc,
 };
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use anyhow::anyhow;
 use tokio::sync::RwLock;
@@ -11,6 +12,7 @@ use bitcoin::{block::Header, p2p::message_filter::{CFHeaders, GetCFHeaders}, Blo
 use tokio::sync::Mutex;
 use tokio::sync::oneshot::error::RecvError;
 use tokio::task::JoinSet;
+use tracing::info;
 use super::{
     checkpoints::{HeaderCheckpoint, HeaderCheckpoints},
     error::{HeaderSyncError},
@@ -48,6 +50,16 @@ pub struct DownloadPersister<B: BlocksStore + 'static, F: FiltersStore + 'static
 }
 
 impl<B: BlocksStore, F: FiltersStore> DownloadPersister<B, F> {
+    pub async fn get_block_hash(&mut self, kind: AdvanceKind, height: u32) -> Option<BlockHash> {
+        match kind {
+            AdvanceKind::Blocks => {
+                self.block_db.get_block_hash(height).await.unwrap_or(None)
+            }
+            AdvanceKind::Filters => {
+                self.filters_db.get_block_hash(height).await.unwrap_or(None)
+            }
+        }
+    }
     pub async fn get_tip(&mut self, kind: AdvanceKind) -> Option<HeaderCheckpoint> {
         match kind {
             AdvanceKind::Blocks => {
@@ -169,6 +181,11 @@ pub(crate) struct Chain<H: HeaderStore, B: BlocksStore + 'static, F: FiltersStor
     cfheader_chain_path: PathBuf,
     pub can_sync_filters: bool,
     cfheader_quorum_required: usize,
+
+    // Median time calculation
+    median_time: u32,
+    median_timestamps: VecDeque<u32>,
+    median_last_height: u32,
 }
 
 #[allow(dead_code)]
@@ -216,9 +233,13 @@ impl<H: HeaderStore, B: BlocksStore, F: FiltersStore> Chain<H, B, F> {
             downloading: Arc::new(RwLock::new(false)),
             prune_height: prune_point.map(|p| p.height),
             can_sync_filters: false,
-            cfheader_quorum_required: quorum_required
+            cfheader_quorum_required: quorum_required,
+            median_time: 0,
+            median_timestamps: VecDeque::with_capacity(11),
+            median_last_height: 0,
         }
     }
+
 
     pub async fn reload_filters(&mut self) -> anyhow::Result<()> {
         let mut err = None;
@@ -293,12 +314,56 @@ impl<H: HeaderStore, B: BlocksStore, F: FiltersStore> Chain<H, B, F> {
             return Ok(BTreeMap::new());
         }
 
+        let range = start_height + 1..start_height + remaining + 1;
+        if range.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+
         let headers = self
-            .fetch_header_range(start_height + 1..start_height + remaining + 1).await
+            .fetch_header_range(range.clone()).await
             .map_err(|e| DownloadRequestError::DatabaseOptFailed {
                 error: e.to_string()
             })?;
+        self.dialog.send_dialog(format!("Fetched header range: {:?} (headers: {})", range,
+                                        headers.len())).await;
+
         Ok(headers)
+    }
+
+    pub(crate) fn median_time(&self) -> u32 {
+        self.median_time
+    }
+
+    pub(crate) async fn update_median_time(&mut self) {
+        let current_height = self.height();
+        let target_count = std::cmp::min(11, current_height + 1) as usize;
+
+        let start_height = current_height.saturating_sub(target_count as u32 - 1);
+        let fetch_start = if self.median_timestamps.is_empty() {
+            start_height
+        } else {
+            self.median_last_height + 1
+        };
+
+        if fetch_start <= current_height {
+            if let Ok(headers) = self.fetch_header_range(fetch_start..current_height + 1).await {
+                for (_, header) in headers {
+                    if self.median_timestamps.len() >= target_count {
+                        self.median_timestamps.pop_front();
+                    }
+                    self.median_timestamps.push_back(header.time);
+                }
+            } else {
+                self.dialog.send_warning(Warning::FailedPersistence {
+                    warning: format!("Failed to fetch headers for median time at height {}", current_height),
+                });
+            }
+        }
+        while self.median_timestamps.len() > target_count {
+            self.median_timestamps.pop_front();
+        }
+        self.median_time = calculate_median(&self.median_timestamps);
+        self.median_last_height = current_height;
     }
 
     pub(crate) async fn advance_downloads_tip(&mut self, filter_sync: bool) -> Result<Vec<DownloadRequest>, DownloadRequestError> {
@@ -548,24 +613,73 @@ impl<H: HeaderStore, B: BlocksStore, F: FiltersStore> Chain<H, B, F> {
         }
     }
 
-    pub(crate) async fn reset_tip(&mut self, kind: AdvanceKind) -> Option<()> {
-        let mut new_tip = self.persister.lock().await.get_tip(kind).await?;
+    pub(crate) async fn reset_tip(&mut self, kind: AdvanceKind) -> anyhow::Result<()> {
+        let mut tip = match self.persister.lock().await.get_tip(kind).await {
+            None => return Ok(()),
+            Some(tip) => tip
+        };
+
         loop {
+            if tip.height == 0 {
+                break;
+            }
+            let expected_hash = match self.blockhash_at_height(tip.height).await {
+                Some(hash) => hash,
+                None => continue
+            };
+            if expected_hash == tip.hash {
+                break;
+            }
+
+            tip.height -= 1;
+            match self.persister.lock().await
+                .get_block_hash(kind, tip.height).await {
+                None => {
+                    tip = self.persister.lock().await.get_default_tip(kind);
+                    break;
+                },
+                Some(hash) => tip.hash = hash,
+            }
+        }
+
+        if !self.persister.lock().await.set_tip(kind, tip).await {
+            return Err(anyhow::anyhow!("Could not reset tip for {}", match kind {
+                AdvanceKind::Blocks => "blocks",
+                AdvanceKind::Filters => "filters"
+            }));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn reset_tip_old(&mut self, kind: AdvanceKind) -> Option<()> {
+        let mut new_tip = self.persister.lock().await.get_tip(kind).await?;
+        info!("Resetting tip");
+        loop {
+            if new_tip.height == 0 {
+                break;
+            }
             let hash = self.blockhash_at_height(new_tip.height).await;
             match hash {
                 None => {
+                    info!("No hash found at height {}", new_tip.height);
                     new_tip.height -= 1;
                     continue;
                 }
                 Some(hash) => {
                     if new_tip.hash != hash {
+                        self.dialog.send_dialog(
+                            format!("Resetting tip found new_tip hash {}, prev_tip hash {} dont match at new tip height {}",
+                                    new_tip.hash, hash,  new_tip.height)).await;
                         new_tip.height -= 1;
                         continue;
                     }
+
+                    info!("Found new tip at {} {} breaking", new_tip.height, new_tip.hash);
                     break;
                 }
             }
         }
+        info!("broke out of the loop");
         self.persister.lock().await.set_tip(kind, new_tip).await;
         Some(())
     }
@@ -768,8 +882,10 @@ impl<H: HeaderStore, B: BlocksStore, F: FiltersStore> Chain<H, B, F> {
                     .await.map_err(|_| HeaderSyncError::DbError)?;
                 self.dialog.send_event(Event::BlocksDisconnected(reorged));
                 self.flush_over_height(stem).await;
-                self.reset_tip(AdvanceKind::Filters).await;
-                self.reset_tip(AdvanceKind::Blocks).await;
+                self.reset_tip(AdvanceKind::Filters).await.map_err(|_| HeaderSyncError::DbError)?;
+                self.reset_tip(AdvanceKind::Blocks).await.map_err(|_| HeaderSyncError::DbError)?;
+                self.median_timestamps.clear();
+                self.median_last_height = 0;
                 Ok(removed_hashes.clone())
             } else {
                 self.dialog.send_warning(Warning::UnexpectedSyncError {
@@ -906,8 +1022,10 @@ impl<H: HeaderStore, B: BlocksStore, F: FiltersStore> Chain<H, B, F> {
                         CFHeaderChain::new(older_anchor, self.cf_header_chain.quorum_required());
                     self.cf_header_chain.save(self.cfheader_chain_path.clone()).await
                         .map_err(|_| HeaderSyncError::DbError)?;
-                    self.reset_tip(AdvanceKind::Filters).await;
-                    self.reset_tip(AdvanceKind::Blocks).await;
+                    self.reset_tip(AdvanceKind::Filters).await
+                        .map_err(|_| HeaderSyncError::DbError)?;
+                    self.reset_tip(AdvanceKind::Blocks).await
+                        .map_err(|_| HeaderSyncError::DbError)?;
                 }
             }
             None => return Err(HeaderSyncError::FloatingHeaders),
@@ -1047,7 +1165,6 @@ impl<H: HeaderStore, B: BlocksStore, F: FiltersStore> Chain<H, B, F> {
         &self,
         range: Range<u32>,
     ) -> Result<BTreeMap<u32, Header>, HeaderPersistenceError<H::Error>> {
-        self.dialog.send_dialog(format!("Fetching header range: {:?}", range)).await;
         let mut db = self.db.lock().await;
         let range_opt = db.load(range).await;
         if range_opt.is_err() {
@@ -1073,5 +1190,21 @@ impl<H: HeaderStore, B: BlocksStore, F: FiltersStore> Chain<H, B, F> {
     // Clear the filter header cache to rescan the filters for new scripts.
     pub(crate) fn clear_filters(&mut self) {
         // self.filter_chain.clear_cache();
+    }
+}
+
+fn calculate_median(timestamps: &VecDeque<u32>) -> u32 {
+    if timestamps.is_empty() {
+        return 0;
+    }
+
+    let mut sorted: Vec<u32> = timestamps.iter().copied().collect();
+    sorted.sort_unstable();
+
+    let len = sorted.len();
+    if len % 2 == 0 {
+        (sorted[len / 2 - 1] + sorted[len / 2]) / 2
+    } else {
+        sorted[len / 2]
     }
 }
