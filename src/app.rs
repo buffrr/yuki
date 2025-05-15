@@ -45,6 +45,15 @@ pub struct Args {
     /// (useful if it's hard/or too slow to find peers serving compact filters)
     #[arg(long, env= "YUKI_EXTERNAL_FILTERS_ENDPOINT")]
     filters_endpoint: Option<String>,
+
+    /// Specify an external endpoint such as https://mempool.space/api/tx
+    /// to use as a mempool acceptance test & broadcast the tx
+    ///
+    /// Note: if the server is down, the check will be skipped.
+    /// Transactions will always be broadcasted to peers
+    /// regardless of this.
+    #[arg(long, env = "YUKI_EXTERNAL_BROADCAST_ENDPOINT")]
+    broadcast_endpoint: Option<String>,
 }
 
 pub async fn run(args: Vec<String>, shutdown: broadcast::Sender<()>) -> anyhow::Result<()> {
@@ -53,17 +62,12 @@ pub async fn run(args: Vec<String>, shutdown: broadcast::Sender<()>) -> anyhow::
     let subscriber = tracing_subscriber::FmtSubscriber::new();
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
-    // Map CLI network to Kyoto network
     let network = args.chain.network();
-
-    // Use provided data directory or default
     let data_dir = args.data_dir.unwrap_or_else(|| PathBuf::from("./data"));
 
-    // Create checkpoint
     let checkpoint = parse_checkpoint(args.checkpoint.as_deref(), network)?;
     let prune_point = parse_checkpoint(args.prune_point.as_deref(), network)?;
 
-    // Build the node
     let mut builder = NodeBuilder::new(network)
         .anchor_checkpoint(checkpoint)
         .prune_point(prune_point)
@@ -72,18 +76,15 @@ pub async fn run(args: Vec<String>, shutdown: broadcast::Sender<()>) -> anyhow::
         .data_dir(data_dir)
         .halt_filter_download();
 
-    if let Some(external) = args.filters_endpoint {
-        builder = builder.external_filter_endpoint(&external);
+    if let Some(filters_endpoint) = args.filters_endpoint {
+        builder = builder.external_filter_endpoint(&filters_endpoint);
     }
 
     let (node, client) = builder
         .build().await
         .map_err(|e| anyhow::anyhow!("Failed to build node: {}", e))?;
 
-    // Create a channel to signal shutdown
     let mut shutdown_rx = shutdown.subscribe();
-
-    // Spawn node task
     let mut node_handle = tokio::spawn(
         async move { Arc::new(node).run().await
     });
@@ -96,13 +97,12 @@ pub async fn run(args: Vec<String>, shutdown: broadcast::Sender<()>) -> anyhow::
         ..
     } = client;
 
-    // Start RPC servers
-    let rpc_handles = start_rpc_listeners(args.rpc_bind, args.rpc_port, requester.clone()).await?;
+    let rpc_handles = start_rpc_listeners(args.rpc_bind,
+                                          args.rpc_port, requester.clone(),
+                                          args.broadcast_endpoint).await?;
 
-    // Main event loop
     loop {
         tokio::select! {
-            // Handle node events
             event = event_rx.recv() => {
                 if event.is_none() {
                     tracing::info!("Event channel closed, shutting down");
@@ -123,7 +123,6 @@ pub async fn run(args: Vec<String>, shutdown: broadcast::Sender<()>) -> anyhow::
                     break;
                 }
             }
-            // Handle warnings
             warn = warn_rx.recv() => {
                 if let Some(warn) = warn {
                     tracing::warn!("{warn}");
@@ -132,7 +131,6 @@ pub async fn run(args: Vec<String>, shutdown: broadcast::Sender<()>) -> anyhow::
                     break;
                 }
             }
-            // Handle node task completion
             result = &mut node_handle => {
                 match result {
                     Ok(_) => tracing::info!("Node task completed"),
@@ -148,19 +146,15 @@ pub async fn run(args: Vec<String>, shutdown: broadcast::Sender<()>) -> anyhow::
         }
     }
 
-    // Shutdown
     tracing::info!("Shutting down...");
     _ = shutdown.send(());
 
-    // Stop RPC servers
     for handle in rpc_handles {
         handle.stop()?;
     }
 
-    // Shutdown node
     requester.shutdown().await?;
 
-    // Ensure node task is complete
     if !node_handle.is_finished() {
         node_handle.await??;
     }
@@ -214,10 +208,13 @@ async fn start_rpc_listeners(
     bind_addresses: Vec<String>,
     port: u16,
     requester: Requester,
+    broadcast_endpoint: Option<String>
 ) -> anyhow::Result<Vec<ServerHandle>> {
     let mut handles = Vec::new();
     let rpc_server = RpcServerImpl {
         requester: requester.clone(),
+        broadcast_endpoint,
+        broadcast_client: reqwest::Client::new()
     };
 
     for addr in bind_addresses {

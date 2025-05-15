@@ -145,7 +145,11 @@ impl Default for MempoolEntryResult {
 
 #[derive(Clone)]
 pub struct RpcServerImpl {
-    pub requester: Requester
+    pub requester: Requester,
+    // Specify an additional endpoint to broadcast
+    // transactions to for mempool acceptance checks
+    pub broadcast_endpoint: Option<String>,
+    pub(crate) broadcast_client: reqwest::Client,
 }
 
 #[async_trait]
@@ -186,6 +190,11 @@ impl RpcServer for RpcServerImpl {
     }
 
     async fn send_raw_transaction(&self, hex_string: String, _max_fee_rate: Option<u32>, _max_burn: Option<u32>) -> Result<Txid, ErrorObjectOwned> {
+        // If a broadcast endpoint is set, test mempool acceptance to provide timely errors to the client.
+        // If the endpoint is unavailable, skip the check for robustness.
+        // Non-accepted transactions will eventually be dropped from our mempool.
+        self.test_mempool_accept(&hex_string).await?;
+
         let tx: Transaction =  bitcoin::consensus::encode::deserialize_hex(&hex_string)
             .map_err(|_| ErrorObjectOwned::owned(-1, "Invalid transaction", None::<String>))?;
 
@@ -224,5 +233,62 @@ impl RpcServer for RpcServerImpl {
             return Err(ErrorObjectOwned::owned(-1, "Headers are still syncing", None::<String>));
         }
         Ok(info.headers)
+    }
+}
+
+impl RpcServerImpl {
+    async fn test_mempool_accept(&self, tx_hex: &str) -> Result<(), ErrorObjectOwned> {
+        let endpoint = match &self.broadcast_endpoint {
+            Some(url) => url,
+            None => return Ok(()),
+        };
+
+        // Send request to broadcast endpoint
+        let response = self.broadcast_client
+            .post(endpoint)
+            .body(tx_hex.to_string())
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) => {
+                let text = match resp.text().await {
+                    Ok(text) => text,
+                    Err(e) => {
+                        tracing::warn!("test mempool accept: could not read response body: {}", e);
+                        return Ok(())
+                    }
+                };
+
+                // Check if response starts with "sendrawtransaction RPC error"
+                if text.starts_with("sendrawtransaction RPC error:") {
+                    // Extract JSON part: remove prefix and parse
+                    let json_str = text.trim_start_matches("sendrawtransaction RPC error: ");
+                    match serde_json::from_str::<serde_json::Value>(json_str) {
+                        Ok(error_json) => {
+                            let code = error_json["code"].as_i64()
+                                .unwrap_or(-25) as i32;
+                            let message = error_json["message"].as_str()
+                                .unwrap_or("Unknown error")
+                                .to_string();
+                            return Err(ErrorObjectOwned::owned(
+                                code,
+                                message,
+                                None::<String>
+                            ));
+                        }
+                        Err(e) => {
+                            tracing::warn!("test mempool accept: could not parse error '{}': {}", json_str, e);
+                            return Ok(());
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Err(e) => {
+                tracing::warn!("test mempool accept: could not perform check: {}", e);
+                Ok(())
+            }
+        }
     }
 }
